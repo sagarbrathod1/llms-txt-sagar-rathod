@@ -25,7 +25,7 @@ from app.api.schemas import (
     VersionResponse,
     VersionSummary,
 )
-from app.config import configure_logging, settings
+from app.config import Settings, configure_logging, settings
 from app.db import create_pool
 from app.engine.urls import normalize_origin
 from app.worker.loop import run_embedded
@@ -74,16 +74,26 @@ async def lifespan(app: FastAPI):
                     log.warning("Embedded worker didn't stop in time; stale recovery will")
 
 
-app = FastAPI(title="llms.txt generator", lifespan=lifespan)
+def add_cors(app: FastAPI, config: Settings) -> None:
+    """Let the web app's origins call this API from the browser.
 
-# The browser calls this API directly from the web app's origin (no proxy), so it needs CORS.
-# Only the configured origins; no credentials, because there are no cookies or auth.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_methods=["GET", "POST", "PATCH"],
-    allow_headers=["Content-Type"],
-)
+    The browser calls the API directly from the web app's origin (no proxy), so it needs CORS.
+    Only the configured origins, plus the optional regex for preview deployments; no
+    credentials, because there are no cookies or auth. A function so tests can apply the same
+    setup to a throwaway app with other settings.
+    """
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.cors_origin_list,
+        # Starlette skips the regex when this is None; "" would compile to a pattern too.
+        allow_origin_regex=config.cors_origin_regex or None,
+        allow_methods=["GET", "POST", "PATCH"],
+        allow_headers=["Content-Type"],
+    )
+
+
+app = FastAPI(title="llms.txt generator", lifespan=lifespan)
+add_cors(app, settings)
 
 
 def get_pool(request: Request) -> AsyncConnectionPool:

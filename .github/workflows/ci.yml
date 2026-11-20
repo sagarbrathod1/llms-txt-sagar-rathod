@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repo; the deploy authenticates to Fly with its own token.
+permissions:
+  contents: read
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -30,8 +34,9 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      # An exact version: setup-uv stopped publishing major tags (v8+) for supply-chain safety.
+      - uses: astral-sh/setup-uv@v10.4.0
       - run: uv sync --frozen
       - run: uv run ruff check
       - run: uv run ruff format --check
@@ -43,8 +48,8 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version-file: frontend/.nvmrc
           cache: npm
@@ -54,3 +59,50 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  # Deploys the API to Fly on every push to main. It waits for both check jobs, so a commit
+  # that fails lint, types or tests never reaches production. Never runs for PRs: their
+  # previews (Vercel) call the production API. The frontend deploys through Vercel's own Git
+  # integration, not here.
+  deploy:
+    needs: [backend, frontend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # One deploy at a time, and a running one is never cancelled: stopping it halfway could
+    # leave the drain machine on an older image than the API. If several pushes land during a
+    # deploy, GitHub keeps only the newest one queued, which is the one that matters.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      APP: llms-txt-sagar-rathod-api
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@v1
+      # --remote-only: build on Fly's builder; the runner has no reason to need Docker.
+      # --ha=false: exactly one API machine. The embedded worker is woken by an in-process
+      # event, so a job queued on one machine wouldn't wake another machine's worker.
+      # Migrations run first, in fly.toml's release_command.
+      - run: flyctl deploy --remote-only --ha=false
+      # fly deploy only updates the app's HTTP machines. The hourly "drain" machine is a
+      # standalone scheduled machine, so it keeps its old image unless pointed at the new one.
+      # --skip-start leaves it stopped, to run on its schedule rather than now.
+      - name: Point the drain machine at the new image
+        run: |
+          set -euo pipefail
+          drain_ids=$(flyctl machine list -a "$APP" -j | jq -r '.[] | select(.name == "drain") | .id')
+          if [ "$(echo "$drain_ids" | grep -c .)" -ne 1 ]; then
+            echo "::error::Expected exactly one machine named 'drain' in $APP, found: '${drain_ids}'"
+            exit 1
+          fi
+          image=$(flyctl releases -a "$APP" --image -j | jq -r 'max_by(.Version).ImageRef // empty')
+          if [ -z "$image" ]; then
+            echo "::error::Could not read the latest release's image for $APP"
+            exit 1
+          fi
+          echo "Updating drain machine $drain_ids to $image"
+          flyctl machine update "$drain_ids" -a "$APP" --image "$image" --skip-start -y
