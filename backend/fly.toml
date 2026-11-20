@@ -21,6 +21,10 @@ kill_timeout = 10
   EMBEDDED_WORKER = "true"
   # Not a secret: the web app's origin, the only one browsers may call the API from.
   CORS_ORIGINS = "https://llms-txt-sagar-rathod.vercel.app"
+  # This project's Vercel preview deployments, so a PR's preview can use the API. Two shapes:
+  # per deployment (a 9-character hash) and per branch ("git-" + branch). Anchored, and ending
+  # in this account's scope slug, which only this account can deploy under.
+  CORS_ORIGIN_REGEX = '^https://llms-txt-sagar-rathod-(?:[a-z0-9]{9}|git-[a-z0-9-]+)-sagarbrathod1s-projects\.vercel\.app$'
 
 [http_service]
   internal_port = 8000

@@ -1,7 +1,9 @@
 """Settings read from environment variables (or a local .env file), and logging setup."""
 
 import logging
+import re
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,12 +16,27 @@ class Settings(BaseSettings):
 
     # Browser origins allowed to call the API, comma-separated, e.g. "https://app.example.com".
     # A plain string rather than list[str]: pydantic-settings would expect a JSON array for a
-    # list, which is awkward to type into a host's env var settings.
-    cors_origins: str = ""
+    # list, which is awkward to type into a host's env var settings. Defaults to the Next.js dev
+    # server so a fresh clone works with no .env; production sets its own origin.
+    cors_origins: str = "http://localhost:3000"
+
+    # Optional extra origins as a regex, for hosts that give every deployment its own URL
+    # (preview builds). Anchor it with ^...$ and keep it to one project's URLs.
+    cors_origin_regex: str = ""
 
     # Run the job worker inside the API process (see app.worker.main for the run modes). Off by
     # default, so local development and tests keep the API and worker separate.
     embedded_worker: bool = False
+
+    @field_validator("cors_origin_regex")
+    @classmethod
+    def _regex_compiles(cls, value: str) -> str:
+        # Fail at startup with a clear error, not on the first request through the middleware.
+        try:
+            re.compile(value)
+        except re.error as e:
+            raise ValueError(f"not a valid regex: {e}") from e
+        return value
 
     @property
     def cors_origin_list(self) -> list[str]:
