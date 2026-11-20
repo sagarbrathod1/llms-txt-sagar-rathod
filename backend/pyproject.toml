@@ -1,0 +1,41 @@
+[project]
+name = "app"
+version = "0.1.0"
+description = "llms.txt generator: API, worker and crawl engine"
+authors = [
+    { name = "Sagar Rathod", email = "97072541+sagarbrathod1@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # HTML parsing in the engine; tolerant of the broken markup real sites serve.
+    "beautifulsoup4>=4.15.0",
+    # Sitemaps are untrusted XML: defusedxml refuses entity-expansion and external-entity tricks.
+    "defusedxml>=0.7.1",
+    "fastapi>=0.165.0",
+    # The engine's HTTP client. Starlette's TestClient already depends on it, so one client.
+    "httpx2>=2.16.2",
+    "psycopg[binary,pool]>=3.3.9",
+    "pydantic-settings>=2.16.3",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "anyio>=4.16.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Defaults plus import sorting, pyupgrade and bugbear: common, low-noise checks.
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
