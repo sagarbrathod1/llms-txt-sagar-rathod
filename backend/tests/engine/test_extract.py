@@ -1,0 +1,160 @@
+from fakesite import page
+
+from app.engine.extract import MAX_DESCRIPTION_CHARS, extract_page
+
+ORIGIN = "https://example.com"
+URL = "https://example.com/docs/"
+
+
+def extract(html, **kwargs):
+    return extract_page(html.encode(), URL, ORIGIN, **kwargs)
+
+
+def test_title_prefers_title_tag_then_og_title_then_h1():
+    og = '<meta property="og:title" content="OG title">'
+    assert extract(page("  Real\n title ", head=og)).title == "Real title"
+    assert extract(page(head=og, body="<h1>Heading</h1>")).title == "OG title"
+    assert extract(page(body="<h1>The <b>heading</b></h1>")).title == "The heading"
+    assert extract(page()).title is None
+
+
+def test_description_prefers_meta_then_og():
+    og = '<meta property="og:description" content="From OG">'
+    assert extract(page(description="From meta", head=og)).description == "From meta"
+    assert extract(page(head=og)).description == "From OG"
+    assert extract(page()).description is None
+
+
+def test_long_description_is_cut_at_a_word():
+    description = extract(page(description="word " * 200)).description
+    assert len(description) <= MAX_DESCRIPTION_CHARS + 1
+    assert description.endswith("word…")
+
+
+def test_noindex_from_meta_or_header():
+    assert extract(page(head='<meta name="robots" content="NOINDEX, follow">')).noindex
+    assert extract(page(), x_robots_tag="noindex").noindex
+    assert not extract(page(head='<meta name="robots" content="index, follow">')).noindex
+
+
+def test_canonical_is_normalized_and_same_origin_only():
+    same = extract(page(head='<link rel="canonical" href="/docs/?utm_source=x">'))
+    assert same.canonical == "https://example.com/docs/"
+    other = extract(page(head='<link rel="canonical" href="https://mirror.com/docs/">'))
+    assert other.canonical is None
+
+
+def test_links_are_same_origin_normalized_and_deduped_in_order():
+    links = ["b", "/a#top", "/a", "https://other.com/", "mailto:x@example.com", "/b.pdf"]
+    assert extract(page(links=links)).links == [
+        "https://example.com/docs/b",
+        "https://example.com/a",
+    ]
+
+
+def test_uses_meta_charset_when_header_has_none():
+    html = '<html><head><meta charset="iso-8859-1"><title>Caf\xe9</title></head></html>'
+    assert extract_page(html.encode("iso-8859-1"), URL, ORIGIN).title == "Café"
+
+
+def test_meta_and_rel_matching_ignores_case():
+    head = (
+        '<META NAME="Description" CONTENT="Upper">'
+        '<meta name="ROBOTS" content="NoIndex">'
+        '<link rel="Canonical" href="/docs/">'
+    )
+    extracted = extract(page(head=head))
+    assert extracted.description == "Upper"
+    assert extracted.noindex
+    assert extracted.canonical == "https://example.com/docs/"
+
+
+def test_title_ignores_inline_svg_titles():
+    html = (
+        "<html><body><svg><title>Close icon</title></svg>"
+        "<head><title>Real title</title></head></body></html>"
+    )
+    assert extract(html).title == "Real title"
+
+
+def test_description_falls_back_to_twitter_and_first_real_paragraph_is_kept():
+    twitter = '<meta name="twitter:description" content="From Twitter card">'
+    assert extract(page(head=twitter)).description == "From Twitter card"
+
+    body = (
+        "<nav><p>Navigation text that is definitely long enough to count as a paragraph.</p></nav>"
+        '<div class="cookie-banner"><p>We use cookies to improve your experience on this site.</p>'
+        "</div><main><p>Short.</p>"
+        "<p>Acme builds widgets that last for decades and ships them worldwide.</p></main>"
+    )
+    expected = "Acme builds widgets that last for decades and ships them worldwide."
+    assert extract(page(body=body)).paragraphs[0] == expected
+
+
+def test_paragraph_fallback_prefers_main_content():
+    body = (
+        "<p>A long introduction paragraph outside of the main element of the page.</p>"
+        "<article><p>The article's own first paragraph, which is what describes it.</p></article>"
+    )
+    expected = "The article's own first paragraph, which is what describes it."
+    assert extract(page(body=body)).paragraphs[0] == expected
+
+
+def test_hreflang_alternates():
+    head = (
+        '<link rel="alternate" hreflang="de" href="/de/">'
+        '<link rel="Alternate" hreflang="x-default" href="/">'
+        '<link rel="alternate" type="application/rss+xml" href="/feed">'
+    )
+    assert extract(page(head=head)).alternates == ["https://example.com/de/"]
+
+
+def test_javascript_notices_are_not_descriptions():
+    body = (
+        '<div id="nojs"><p>Notice: This page displays a fallback because scripts did not run.</p>'
+        "</div><noscript><p>Please enable JavaScript to use every feature of this website.</p>"
+        "</noscript><p>Python is used in many application domains, from web to science.</p>"
+    )
+    expected = "Python is used in many application domains, from web to science."
+    assert extract(page(body=body)).paragraphs[0] == expected
+
+
+def test_no_js_class_on_html_does_not_hide_the_content():
+    html = (
+        '<html class="no-js"><head><title>T</title></head><body>'
+        "<p>Python is used in many application domains, from web to science.</p></body></html>"
+    )
+    expected = "Python is used in many application domains, from web to science."
+    assert extract(html).paragraphs == [expected]
+
+
+def test_image_map_links_are_followed():
+    body = '<map name="nav"><area shape="rect" href="/essays/great-work.html"></map>'
+    assert extract(page(body=body)).links == ["https://example.com/essays/great-work.html"]
+
+
+def test_meta_description_html_is_stripped():
+    head = '<meta name="description" content="&lt;p&gt;Breaking &lt;b&gt;news&lt;/b&gt;&lt;/p&gt;">'
+    assert extract(page(head=head)).description == "Breaking news"
+
+
+def test_fallback_paragraphs_must_read_as_descriptions():
+    body = (
+        "<main><p>Posted Nov 19 by Jane Doe in the community updates section of the blog.</p>"
+        "<p>Download Node.js v22.11.0 for your platform and get started building today.</p>"
+        "<p>Node.js is a free, open source JavaScript runtime for servers and tools</p>"
+        "<p>Node.js is a free, open source JavaScript runtime for building servers.</p></main>"
+    )
+    # Dated, versioned, and unfinished sentences are skipped.
+    expected = ["Node.js is a free, open source JavaScript runtime for building servers."]
+    assert extract(page(body=body)).paragraphs == expected
+
+
+def test_alternative_site_names_from_application_name_and_jsonld():
+    head = (
+        '<meta name="application-name" content="Acme App">'
+        '<script type="application/ld+json">{"@graph": [{"@type": "Organization", '
+        '"name": "Acme Inc"}, {"@type": ["WebSite"], "name": "Acme"}]}</script>'
+        '<script type="application/ld+json">{broken</script>'
+    )
+    assert extract(page(head=head)).alt_site_names == ["Acme App", "Acme", "Acme Inc"]
