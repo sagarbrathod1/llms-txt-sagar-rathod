@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+/* Colors live in variables so dark mode is one override here instead of a dark: variant on
+   every element. */
+:root {
+  --background: #ffffff;
+  --foreground: #18181b;
+  --muted: #52525b;
+  --surface: #f4f4f5;
+  --border: #d4d4d8;
+  --accent: #1d4ed8;
+  --accent-foreground: #ffffff;
+  --danger: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #09090b;
+    --foreground: #f4f4f5;
+    --muted: #a1a1aa;
+    --surface: #18181b;
+    --border: #3f3f46;
+    --accent: #60a5fa;
+    --accent-foreground: #09090b;
+    --danger: #f87171;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-danger: var(--danger);
+  /* Geist is loaded by next/font in layout.tsx; these make font-sans / font-mono use it. */
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* One rule gives every interactive element a visible keyboard focus ring. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@layer components {
+  .btn {
+    /* enabled:hover so a disabled button doesn't look clickable on hover. */
+    @apply inline-flex items-center justify-center rounded-md border border-border px-3 py-1.5 text-sm font-medium enabled:hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    /* Repeats bg-accent under enabled:hover to override .btn's hover background. */
+    @apply border-accent bg-accent text-accent-foreground enabled:hover:bg-accent enabled:hover:opacity-90;
+  }
+}
