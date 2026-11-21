@@ -38,6 +38,11 @@ TAG = re.compile(r"<[^>]+>")
 # Paragraphs kept per page. The first is often a site-wide banner ("Try our new ...") that
 # every page shares; the next ones give the description a chance to be about the page.
 MAX_PARAGRAPHS = 3
+# Paragraphs examined per page before giving up: the description is near the top, and a
+# page of thousands of tiny paragraphs mustn't cost thousands of structural checks.
+MAX_PARAGRAPHS_EXAMINED = 50
+# How far up from a paragraph a card (one heading, one paragraph) is looked for.
+CARD_DEPTH = 4
 # Paragraphs inside these are site chrome, not the page's content.
 CHROME_TAGS = {"aside", "footer", "form", "header", "nav", "noscript"}
 # class/id hints of banners, pop-ups and "JavaScript didn't run" notices (python.org's
@@ -201,41 +206,67 @@ def _content_root(soup: BeautifulSoup) -> Tag:
 
 def _first_paragraphs(root: Tag, url: str, origin: str) -> list[str]:
     """The first few substantial paragraphs of the page's own content, skipping site chrome,
-    teasers for other pages, and paragraphs that are nearly all links (a tag cloud)."""
+    teasers for other pages, and paragraphs that are nearly all links (a tag cloud).
+
+    One pass in document order, remembering the last heading seen, so the work stays linear
+    in the page's size: the parse thread is shared, and nothing can interrupt it.
+    """
     found: list[str] = []
-    for paragraph in root.find_all("p"):
-        if len(found) == MAX_PARAGRAPHS:
+    examined = 0
+    heading: Tag | None = None  # the last heading before the current element
+    for element in root.descendants:
+        if not isinstance(element, Tag):
+            continue
+        if element.name in HEADINGS:
+            heading = element
+            continue
+        if element.name != "p":
+            continue
+        examined += 1
+        if len(found) == MAX_PARAGRAPHS or examined > MAX_PARAGRAPHS_EXAMINED:
             break
+        # Cheap checks first; the structural ones only run on real candidates.
+        text = clean_text(element.get_text(" "))
+        if not (text and len(text) >= MIN_PARAGRAPH_CHARS and _reads_as_description(text)):
+            continue
         if (
-            _inside_chrome(paragraph, root)
-            or _is_teaser(paragraph, root, url, origin)
-            or _link_text_share(paragraph) > LINK_LIST_SHARE
+            _inside_chrome(element, root)
+            or _link_text_share(element) > LINK_LIST_SHARE
+            or _is_teaser(element, heading, root, url, origin)
         ):
             continue
-        text = clean_text(paragraph.get_text(" "))
-        if text and len(text) >= MIN_PARAGRAPH_CHARS and _reads_as_description(text):
-            found.append(text)
+        found.append(text)
     return found
 
 
-def _is_teaser(paragraph: Tag, root: Tag, url: str, origin: str) -> bool:
+def _is_teaser(paragraph: Tag, heading: Tag | None, root: Tag, url: str, origin: str) -> bool:
     """Whether the paragraph introduces another page, as in a card on a section front.
 
-    Either a link to another page wraps it (BBC wraps whole cards), or the nearest heading
-    around it links to another page ("<h2><a href=/post>Title</a></h2><p>First lines...</p>"
-    on a blog's front page). Headings linking to themselves (permalinks, "¶") don't count.
+    - A link to another page wraps it (BBC wraps whole cards).
+    - The heading before it links to another page ("<h2><a href=/post>Title</a></h2>
+      <p>First lines...</p>" on a blog's front page). Headings linking to themselves
+      (permalinks, "¶") don't count, and neither do headings after it ("Read next").
+    - It's the one paragraph of a small card whose one heading, before or after it, links
+      to another page (The Verge puts the headline below the blurb).
     """
-    for parent in paragraph.parents:
+    for depth, parent in enumerate(paragraph.parents):
         if parent is root:
-            return False
+            break
         if parent.name == "a":
             return _links_elsewhere([parent], url, origin)
-        if heading := parent.find(HEADINGS):
-            anchors = heading.find_all("a", href=True)
-            if wrapper := heading.find_parent("a", href=True):
-                anchors.append(wrapper)
-            return _links_elsewhere(anchors, url, origin)
-    return False
+        if depth < CARD_DEPTH and (headings := parent.find_all(HEADINGS, limit=2)):
+            card = len(headings) == 1 and len(parent.find_all("p", limit=2)) == 1
+            if card and _heading_links_elsewhere(headings[0], url, origin):
+                return True
+            break  # the nearest container with a heading decides; larger ones aren't cards
+    return heading is not None and _heading_links_elsewhere(heading, url, origin)
+
+
+def _heading_links_elsewhere(heading: Tag, url: str, origin: str) -> bool:
+    anchors = heading.find_all("a", href=True)
+    if wrapper := heading.find_parent("a", href=True):
+        anchors.append(wrapper)
+    return _links_elsewhere(anchors, url, origin)
 
 
 def _links_elsewhere(anchors: list[Tag], url: str, origin: str) -> bool:

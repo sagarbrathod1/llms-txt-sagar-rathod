@@ -1,3 +1,6 @@
+import time
+
+import pytest
 from fakesite import page
 
 from app.engine.extract import MAX_DESCRIPTION_CHARS, extract_page
@@ -193,3 +196,40 @@ def test_nearly_all_link_text_marks_a_hub_and_skips_tag_clouds():
         '<a href="/b">this nice blog post</a> today.'
     )
     assert extract(page(body=f"<main><p>{prose}</p></main>")).paragraphs
+
+
+INTRO = "This guide explains how the widget pipeline works and how to configure it."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A linked "Read next" heading after the intro.
+        f'<h1>Guide</h1><p>{INTRO}</p><h2><a href="/next">Read next</a></h2><p>{INTRO} 2</p>',
+        # Linked cards after the intro, in the same wrapper.
+        f"<div><p>{INTRO}</p>"
+        + "".join(
+            f'<div><h2><a href="/c{n}">Card {n}</a></h2><p>Teaser {n}.</p></div>' for n in range(3)
+        )
+        + "</div>",
+        # A doc whose later section heading links to the API reference.
+        f'<div><p>{INTRO}</p><h2><a href="/api">API</a></h2><p>Call it like this.</p></div>',
+    ],
+)
+def test_a_linked_heading_after_the_intro_does_not_make_it_a_teaser(body):
+    assert extract(page(body=f"<main>{body}</main>")).paragraphs[:1] == [INTRO]
+
+
+def test_a_card_with_its_headline_below_the_blurb_is_a_teaser():
+    # The Verge's cards put the linked headline under the text.
+    card = f'<div><div><p>{INTRO}</p></div><h2><a href="/story">Story</a></h2></div>'
+    assert extract(page(body=f"<main>{card}{card}</main>")).paragraphs == []
+
+
+def test_a_page_of_thousands_of_paragraphs_parses_quickly():
+    """Regression: teaser checks scanned the whole wrapper for every paragraph, so a 160 KB
+    page of 6,000 short paragraphs took 36 s on the parse thread, which nothing can stop."""
+    lines = "".join(f"<p>Short line number {n}.</p>" for n in range(6000))
+    started = time.perf_counter()
+    extract(page(body=f"<main><div>{lines}</div></main>"))
+    assert time.perf_counter() - started < 2  # generous: about 0.1 s in practice
