@@ -45,7 +45,7 @@ export function GenerateForm() {
   }, []);
 
   return (
-    <>
+    <div className="mx-auto max-w-lg text-left">
       <form
         action="/"
         onSubmit={(event) => {
@@ -65,24 +65,28 @@ export function GenerateForm() {
           type="text"
           inputMode="url"
           autoComplete="url"
+          autoFocus
           required
           placeholder="example.com"
           value={url}
+          readOnly={submitting}
           onChange={(event) => setUrl(event.target.value)}
           aria-invalid={error !== null}
           aria-describedby={error ? "url-error" : undefined}
-          className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2"
+          className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2 placeholder:text-muted/60 read-only:text-muted"
         />
+        {/* The first request after a quiet period can take a few seconds; the button saying
+            "Generating…" covers that wait without explaining why. */}
         <button type="submit" disabled={submitting} className="btn btn-primary px-4 py-2">
-          {submitting ? "Starting…" : "Generate"}
+          {submitting ? "Generating…" : "Generate"}
         </button>
       </form>
 
       {error && (
-        <p id="url-error" role="alert" className="text-danger">
+        <p id="url-error" role="alert" className="mt-2 text-sm text-danger">
           {error}
         </p>
       )}
-    </>
+    </div>
   );
 }
