@@ -156,7 +156,13 @@ class Crawl:
         await self._fetch_all(ranker.pick_to_fetch(ranker.rank(candidates), budget))
 
     def _candidates(self, urls: list[str]) -> list[str]:
-        candidates = [url for url in dict.fromkeys(urls) if self.should_fetch(url)]
+        """URLs worth fetching: none already tried, even spelled differently (the sitemap's
+        /docs/ after the homepage's /docs), and no version copies of each other."""
+        tried = {self.layout.version_free_key(url) for url in self.attempted}
+        candidates = [
+            url for url in dict.fromkeys(urls)
+            if self.should_fetch(url) and self.layout.version_free_key(url) not in tried
+        ]  # fmt: skip
         return self.layout.without_version_copies(candidates)
 
     async def follow_links(self, start_urls: list[str]) -> None:

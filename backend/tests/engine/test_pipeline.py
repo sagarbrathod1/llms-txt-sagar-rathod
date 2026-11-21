@@ -972,3 +972,18 @@ def test_a_page_that_redirects_to_a_login_page_is_left_out():
     result = run(FakeSite(routes))
     assert "Sign in" not in result.llms_txt
     assert any("redirects to a login page" in w for w in result.warnings)
+
+
+def test_a_page_fetched_from_the_homepage_is_not_fetched_again_from_the_sitemap():
+    # The homepage links /docs and the sitemap lists /docs/: the same page, fetched once.
+    docs = [f"{ORIGIN}/docs/p{n}" for n in range(12)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/docs"]),
+        f"{ORIGIN}/sitemap.xml": urlset(f"{ORIGIN}/docs/", *docs),
+        f"{ORIGIN}/docs": page("Docs | Acme"),
+        f"{ORIGIN}/docs/": page("Docs | Acme"),
+    }
+    routes |= {url: page(f"Page {url[-2:]} | Acme") for url in docs}
+    site = FakeSite(routes)
+    run(site)
+    assert sum(url.startswith(f"{ORIGIN}/docs") and len(url) <= 25 for url in site.requests) == 1
