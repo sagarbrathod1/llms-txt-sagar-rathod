@@ -210,6 +210,11 @@ class Crawl:
         if final_url is None:
             self.skipped[url] = "redirects to another site"
             return None
+        # Judged again after redirects: python.org's /accounts/ redirects to a login page
+        # (/accounts/login/?next=...), which the URL we asked for didn't show.
+        if self.layout.is_excluded(final_url):
+            self.skipped[url] = "redirects to a login page, a translation or another version"
+            return None
         try:
             # Parsing is CPU work (tens of ms for a big page), so it runs on the parse thread.
             page = await parse_page(

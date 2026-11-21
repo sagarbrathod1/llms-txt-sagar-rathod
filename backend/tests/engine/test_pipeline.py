@@ -844,3 +844,26 @@ def test_a_site_refusing_with_406_and_bot_checks_is_an_error():
         GenerationError, match=r"blocking our crawler: 8 of the 10 .*406.*bot check"
     ):
         run(FakeSite(routes))
+
+
+def test_policy_pages_with_extensions_or_in_other_languages_go_to_optional():
+    """Regression (Patagonia's /privacy-notice.html, Spiegel's /datenschutz in main sections)."""
+    links = ["/privacy-notice.html", "/datenschutz", "/mentions-legales", "/about", "/team"]
+    routes = {f"{ORIGIN}/": home(links=links)}
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in links}
+    pages = run(FakeSite(routes)).pages
+    optional = {p.url.removeprefix(ORIGIN) for p in pages if p.section == "Optional"}
+    assert optional == {"/privacy-notice.html", "/datenschutz", "/mentions-legales"}
+
+
+def test_a_page_that_redirects_to_a_login_page_is_left_out():
+    """Regression (python.org): /accounts/ redirected to /accounts/login/?next=..., a URL the
+    crawl would never have fetched, and the login page was listed."""
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(links=[*NAV, "/account-area"]),
+        f"{ORIGIN}/account-area": redirect("/members/login/?next=/account-area"),
+        f"{ORIGIN}/members/login/?next=/account-area": page("Sign in | Acme"),
+    }
+    result = run(FakeSite(routes))
+    assert "Sign in" not in result.llms_txt
+    assert any("redirects to a login page" in w for w in result.warnings)

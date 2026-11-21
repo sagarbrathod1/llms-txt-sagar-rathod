@@ -190,3 +190,15 @@ def test_dominant_cap_gives_slots_back_when_nothing_else_needs_them(monkeypatch)
     docs = [f"/docs/{area}/p{n}" for area in "abc" for n in range(3)]
     listed = [url for _, urls in sections_of(docs, layout=layout) for url in urls]
     assert len(listed) == 9  # an all-docs site still lists all of them
+
+
+def test_policy_pages_with_extensions_brand_names_or_in_other_languages():
+    r = ranker(layout=SiteLayout(brand_words=frozenset({"spiegel"})))
+    for path in ["/privacy-notice.html", "/terms-of-use.html", "/web-accessibility.html",
+                 "/datenschutz-spiegel", "/nutzungsbedingungen", "/barrierefreiheit", "/agb",
+                 "/mentions-l%C3%A9gales", "/aviso-legal", "/aup", "/dpa",
+                 "/legal/acceptable-use-policy", "/help/terms-conditions"]:  # fmt: skip
+        assert r.is_low_value(ORIGIN + path), path
+    for path in ["/spiegel", "/stories.html", "/docs/privacy-features", "/datenschutz-tools/x",
+                 "/tags/privacy.html"]:  # fmt: skip
+        assert not r.is_low_value(ORIGIN + path), path

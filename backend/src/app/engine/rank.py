@@ -6,6 +6,7 @@ can be explained by pointing at the URL and the link counts.
 
 import math
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -52,20 +53,32 @@ LISTING_SEGMENTS = {"archive", "archives", "author", "authors", "category", "cat
                     "page", "tag", "tags"}  # fmt: skip
 # Policy, account and job pages an agent rarely needs: they go under "## Optional".
 LOW_VALUE_SEGMENTS = {
-    "accessibility", "accessibility-statement", "account", "accounts", "careers", "cart",
-    "checkout", "cookie-policy", "cookie-settings", "cookies", "copyright", "disclaimer",
+    "accessibility", "accessibility-statement", "account", "accounts", "aup", "careers", "cart",
+    "checkout", "cookie-policy", "cookie-settings", "cookies", "copyright", "disclaimer", "dpa",
     "gdpr", "imprint", "impressum", "jobs", "legal", "log-in", "login", "privacy",
     "privacy-notice", "privacy-policy", "register", "sign-in", "sign-up", "signin", "signup",
     "terms", "terms-and-conditions", "terms-of-service", "terms-of-use", "tos",
+    # German, French and Spanish policy pages (Spiegel's /datenschutz, /nutzungsbedingungen).
+    # Matched without accents, so "mentions-légales" is "mentions-legales".
+    "agb", "barrierefreiheit", "datenschutz", "datenschutzerklarung", "datenschutzerklaerung",
+    "nutzungsbedingungen", "teilnahmebedingungen",
+    "accessibilite", "cgu", "cgv", "conditions-generales", "conditions-generales-d-utilisation",
+    "conditions-generales-de-vente", "confidentialite", "donnees-personnelles",
+    "mentions-legales", "politique-de-confidentialite",
+    "accesibilidad", "aviso-legal", "condiciones-de-uso", "politica-de-cookies",
+    "politica-de-privacidad", "privacidad", "terminos-de-uso", "terminos-y-condiciones",
 }  # fmt: skip
 # Policy slugs beyond the exact names above: a policy word plus policy-ish suffixes, as in
-# /privacy-security, /accessibility-policy, /cookie-preferences. Whole slugs only, so
-# /legal-services, /cookie-recipes or /careers-advice stay content.
+# /privacy-security, /accessibility-policy, /cookie-preferences, /web-accessibility. Whole
+# slugs only, so /legal-services, /cookie-recipes or /careers-advice stay content.
 POLICY_SLUG = re.compile(
-    r"^(accessibility|cookies?|gdpr|legal|privacy|terms)"
-    r"(-(and|center|centre|conditions|info|information|notice|of|policies|policy|preferences"
-    r"|security|service|settings|statement|use))*$"
+    r"^((web|website|site)-)?(acceptable-use|accessibility|cookies?|data-processing|gdpr|legal"
+    r"|privacy|terms)"
+    r"(-(addendum|agreement|and|center|centre|conditions|info|information|notice|of|policies"
+    r"|policy|preferences|security|service|settings|statement|use))*$"
 )
+# File extensions some sites keep in their URLs (Patagonia's /privacy-notice.html).
+PAGE_EXTENSION = re.compile(r"\.(aspx?|html?|jsp|php)$")
 # Words in section names that are abbreviations despite containing vowels.
 ACRONYMS = {"ai", "api", "cli", "eu", "faq", "ios", "seo", "til", "ui", "uk", "url", "us"}
 
@@ -204,13 +217,24 @@ class Ranker:
         """Policy and account pages. Matched on the first or last folder only, and the last
         only near the root: /legal/terms and /about/privacy are policies, but a deep
         /docs/web/privacy page is content about privacy."""
-        segments = self.layout.segments(url)
-        if not segments:
+        segments = [self._slug(segment) for segment in self.layout.segments(url)]
+        if not segments or LISTING_SEGMENTS & set(segments):  # /tags/privacy: posts on privacy
             return False
         if _is_policy_name(segments[0]):
             return True
-        # Deeper down, only an exact name: /docs/privacy-features is content, not a policy.
-        return len(segments) <= 2 and segments[-1] in LOW_VALUE_SEGMENTS
+        # The last folder only near the root: /help/terms-conditions is a policy, a deep
+        # /docs/web/privacy is content. /docs/privacy-features never matches a policy name.
+        return len(segments) <= 2 and _is_policy_name(segments[-1])
+
+    def _slug(self, segment: str) -> str:
+        """A path segment as a policy name: "privacy-notice.html" -> "privacy-notice",
+        "mentions-légales" -> "mentions-legales", and the site's own name dropped,
+        "datenschutz-spiegel" -> "datenschutz" (unless nothing else is left)."""
+        segment = PAGE_EXTENSION.sub("", segment)
+        segment = unicodedata.normalize("NFKD", segment)
+        segment = "".join(char for char in segment if not unicodedata.combining(char))
+        words = [word for word in segment.split("-") if word not in self.layout.brand_words]
+        return "-".join(words) or segment
 
     def build_sections(self, pages: list[PageInfo]) -> list[tuple[str, list[PageInfo]]]:
         """Select the top pages and group them into ordered (section name, pages) pairs.
