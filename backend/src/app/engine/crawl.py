@@ -11,6 +11,7 @@ from app.engine.fetch import MAX_PAGE_BYTES, USER_AGENT, DeadlineError, Fetcher,
 from app.engine.layout import SiteLayout
 from app.engine.models import GenerationError, Progress
 from app.engine.rank import MAX_PAGES_PER_SECTION, Ranker, in_other_language, inlink_counts
+from app.engine.titles import TITLE_SEPARATOR
 from app.engine.urls import normalize_page_url
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,31 @@ BFS_MAX_DEPTH = 3
 # More failures than this, and more than half of the pages tried, mean the site is down or
 # blocking us; a file built from the few that worked would misrepresent the site.
 MIN_FAILURES_TO_GIVE_UP = 3
+# Titles of the pages bot-protection services serve in place of the real page, often with
+# HTTP 200 (Le Monde's "Client Challenge"). Matched against the title's first part without
+# trailing punctuation, so "Just a moment..." and "Attention Required! | Cloudflare" match.
+# Detected so we can stop and say so: we never try to get past them.
+BOT_CHECK_TITLES = {
+    "access denied", "are you a robot", "attention required", "client challenge",
+    "ddos-guard", "human verification", "just a moment", "one more step",
+    "pardon our interruption", "verifying you are human",
+}  # fmt: skip
+
+
+def is_bot_check(title: str | None) -> bool:
+    if not title:
+        return False
+    first_part = TITLE_SEPARATOR.split(title)[0]
+    return first_part.lower().rstrip(" .…!?") in BOT_CHECK_TITLES
+
+
+def is_empty_shell(page: Page) -> bool:
+    """No links into the site and no paragraph of text: nothing an llms.txt could describe.
+
+    What a JavaScript app serves for every route before its scripts run, and what bot checks
+    look like. Real pages, however short, link to the rest of their site.
+    """
+    return not page.links and not page.paragraphs
 
 
 def fetch_budget(fetcher: Fetcher) -> int:
@@ -74,6 +100,9 @@ class Crawl:
         # 401/403: the site refused us. Also in `failed`: a recheck that was blocked must not
         # replace a good version. Tracked separately for the "blocking our crawler" error.
         self.refused: set[str] = set()
+        # Pages answered with a bot check instead of the content (URL -> its title). Also in
+        # `failed` and `refused`: the site refused us, just with HTTP 200.
+        self.bot_checks: dict[str, str] = {}
         # Definite answers (404, not HTML, redirects off-site): the page simply isn't one we
         # can list. Not "failed", or a stale sitemap would block versioning forever.
         self.skipped: dict[str, str] = {}
@@ -181,6 +210,11 @@ class Crawl:
             logger.warning("couldn't parse %s", url, exc_info=True)
             self.skipped[url] = "couldn't be parsed"
             return None
+        if is_bot_check(page.title):
+            self.bot_checks[url] = page.title or ""
+            self.failed[url] = f"answered with a bot check, {page.title!r}"
+            self.refused.add(url)
+            return None
         self.pages.setdefault(final_url, page)
         return page
 
@@ -189,17 +223,43 @@ class Crawl:
         if self.fetcher.gave_up:
             raise GenerationError("This site is rate-limiting our crawler, so try again later.")
         tried = len(self.attempted) - len(self.unsent) - 1  # requests sent, minus the homepage
-        if len(self.refused) >= MIN_FAILURES_TO_GIVE_UP and len(self.refused) > tried / 2:
+        if self._is_most_of(len(self.bot_checks), tried):
+            counts = Counter(self.bot_checks.values())
+            # Ties broken by the title itself: pages finish in any order, messages shouldn't.
+            title = min(counts, key=lambda title: (-counts[title], title))
+            raise bot_check_error(f"{len(self.bot_checks)} of the {tried} pages we tried", title)
+        shell_title = self.shell_title()
+        if shell_title and shell_title != self.home.title:
+            # Identical empty pages under a title the homepage doesn't have: a bot check from
+            # a service whose title we don't know. (Under the homepage's title: an app shell.)
+            raise bot_check_error(f"most of the {len(self.pages)} pages we fetched", shell_title)
+        if self._is_most_of(len(self.refused), tried):
             raise GenerationError(
                 f"This site is blocking our crawler: {len(self.refused)} of the {tried} pages "
-                "we tried answered HTTP 401 or 403."
+                "we tried answered HTTP 401 or 403, or with a bot check."
             )
-        if len(self.failed) >= MIN_FAILURES_TO_GIVE_UP and len(self.failed) > tried / 2:
+        if self._is_most_of(len(self.failed), tried):
             raise GenerationError(
                 f"{len(self.failed)} of the {tried} pages we tried couldn't be fetched "
                 "(timeouts or server errors), so the result would be badly incomplete. "
                 "Try again later."
             )
+
+    @staticmethod
+    def _is_most_of(count: int, tried: int) -> bool:
+        return count >= MIN_FAILURES_TO_GIVE_UP and count > tried / 2
+
+    def shell_title(self) -> str | None:
+        """When most fetched pages are the same empty shell, its title ("" if untitled).
+
+        A site whose pages can't be told apart can't be described page by page: it's either a
+        JavaScript app (every route serves the homepage's shell) or a bot check.
+        """
+        titles = Counter(page.title or "" for page in self.pages.values() if is_empty_shell(page))
+        if not titles:
+            return None
+        title, count = titles.most_common(1)[0]
+        return title if self._is_most_of(count, len(self.pages)) else None
 
     def _count_crawled(self) -> None:
         self.crawled += 1
@@ -212,6 +272,13 @@ class Crawl:
     def warnings(self) -> list[str]:
         """Aggregated, so a big site gives a few readable lines rather than hundreds."""
         out = []
+        # Only an app shell gets this far: raise_if_unusable stops on a bot check's shell.
+        if self.shell_title() is not None:
+            out.append(
+                "Most pages came back as the same empty page as the homepage: the site builds "
+                "its pages with JavaScript, which this tool doesn't run. Their titles were taken "
+                "from their URLs."
+            )
         if self.out_of_time:
             out.append(
                 "The crawl hit its time limit, so only the pages fetched by then are listed."
@@ -243,3 +310,10 @@ class Crawl:
                 url = min(problems)
                 out.append(f"{len(problems)} page(s) {what}, e.g. {url} ({problems[url]}).")
         return out
+
+
+def bot_check_error(what: str, title: str) -> GenerationError:
+    return GenerationError(
+        f'This site showed a bot check ("{title}") instead of {what}, so it can\'t be '
+        "crawled. It blocks automated tools, and this one doesn't try to get past that."
+    )

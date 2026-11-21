@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
-from app.engine.crawl import Crawl, fetch_budget
+from app.engine.crawl import Crawl, bot_check_error, fetch_budget, is_bot_check
 from app.engine.discover import collect_sitemap_urls, fetch_robots
 from app.engine.extract import Page, parse_page
 from app.engine.fetch import (
@@ -25,7 +25,14 @@ from app.engine.layout import SiteLayout
 from app.engine.models import GenerationError, GenerationResult, PageInfo, Progress
 from app.engine.rank import unique_pages
 from app.engine.render import render_llms_txt
-from app.engine.titles import add_path_hints, choose_site_name, page_title, shared_title_parts
+from app.engine.titles import (
+    MAX_SITE_NAME_WORDS,
+    TITLE_SEPARATOR,
+    add_path_hints,
+    choose_site_name,
+    page_title,
+    shared_title_parts,
+)
 from app.engine.urls import normalize_page_url, origin_of
 
 # A user watches a progress bar meanwhile, and ~2.5 minutes is the most we ask them to wait.
@@ -42,6 +49,9 @@ class Site:
     """What we know about the site before crawling it: where it lives and its homepage."""
 
     origin: str  # after the homepage's redirects, e.g. https://www.example.com
+    # The folder the site lives in: "/" unless the homepage redirected into a folder of
+    # another site (docs.pydantic.dev -> pydantic.dev/docs/), when only that folder is crawled.
+    base: str
     robots: RobotFileParser
     home: Page
     name: str
@@ -56,14 +66,18 @@ async def run(
     warnings = list(site.warnings)
     if delay := site.robots.crawl_delay(USER_AGENT):
         fetcher.set_crawl_delay(float(delay))
+        # Say what we did: a long delay is capped (see MAX_CRAWL_DELAY_SECONDS).
+        spacing = f"{fetcher.spacing:g} s apart"
+        if fetcher.spacing < float(delay):
+            spacing += " (our maximum)"
         warnings.append(
-            f"robots.txt asks for {delay} s between requests, so pages are fetched one at a "
-            "time and fewer of them fit in the time limit."
+            f"robots.txt asks for {delay} s between requests, so pages were fetched one at a "
+            f"time, {spacing}, and fewer of them fit in the time limit."
         )
 
     sitemap_urls, sitemap_warnings = await read_sitemaps(fetcher, site)
     warnings += sitemap_warnings
-    layout = SiteLayout.detect(site.home, site.name, site.home.links + sitemap_urls)
+    layout = SiteLayout.detect(site.home, site.name, site.home.links + sitemap_urls, site.base)
     crawl = Crawl(
         fetcher, site.origin, site.robots, site.home, layout, on_progress, fetch_budget(fetcher)
     )
@@ -82,10 +96,10 @@ async def run(
 
     sections = crawl.ranker().build_sections(describe_pages(site, crawl))
     sections = add_path_hints(sections, layout.segments)
-    summary = site.home.description or next(iter(site.home.paragraphs), None)
+    summary = site.home.description or next(iter(_own_paragraphs(site.home)), None)
     if summary and _loose(summary) == _loose(site.name):
         summary = None  # "> Acme" under "# Acme" says nothing
-    llms_txt = render_llms_txt(site.name, summary, sections, site.origin + "/")
+    llms_txt = render_llms_txt(site.name, summary, sections, site.origin + site.base)
 
     warnings += crawl.warnings()
     if not sections:
@@ -107,6 +121,8 @@ async def resolve_site(fetcher: Fetcher, origin: str) -> Site:
 
     example.com often redirects to www.example.com (or http to https). We crawl the site we
     landed on, since that's where its pages and links live, and obey that site's robots.txt.
+    When a site redirects into a folder of another one (docs.pydantic.dev ->
+    pydantic.dev/docs/), that folder is what the user asked about, so the crawl stays in it.
     """
     warnings = []
     robots = await load_robots(fetcher, origin)
@@ -115,16 +131,35 @@ async def resolve_site(fetcher: Fetcher, origin: str) -> Site:
     final_origin = origin_of(home_result.url)
     if final_origin is None:
         raise GenerationError(f"{origin} redirects to an address we can't crawl.")
+    home_url = normalize_page_url(home_result.url, home_result.url, final_origin)
+    home_url = home_url or final_origin + "/"
+    base = "/"
     if final_origin != origin:
-        warnings.append(f"{origin} redirects to {final_origin}, so that site was crawled.")
+        if _host(final_origin) != _host(origin):
+            base = _folder(home_url)
+        moved_to = final_origin + base.rstrip("/")
+        part = "that part of the site" if base != "/" else "that site"
+        warnings.append(f"{origin} redirects to {moved_to}, so {part} was crawled.")
         origin = final_origin
         robots = await load_robots(fetcher, origin)
 
-    home_url = normalize_page_url(home_result.url, home_result.url, origin) or origin + "/"
     home = await parse_page(home_result.body, home_url, origin, home_result.charset)
+    if is_bot_check(home.title):
+        raise bot_check_error("its homepage", home.title or "")
     hostname = urlsplit(origin).hostname or ""
     name = choose_site_name(home.site_name, home.alt_site_names, home.title, hostname)
-    return Site(origin=origin, robots=robots, home=home, name=name, warnings=warnings)
+    return Site(origin=origin, base=base, robots=robots, home=home, name=name, warnings=warnings)
+
+
+def _host(origin: str) -> str:
+    """ "https://www.example.com" -> "example.com": www. and http variants are one site."""
+    return (urlsplit(origin).hostname or "").removeprefix("www.")
+
+
+def _folder(url: str) -> str:
+    """The folder a URL is in: "/docs/" for /docs/ and /docs/intro, "/" for /welcome."""
+    path = urlsplit(url).path
+    return path[: path.rfind("/") + 1] or "/"
 
 
 async def load_robots(fetcher: Fetcher, origin: str) -> RobotFileParser:
@@ -164,9 +199,14 @@ async def read_sitemaps(fetcher: Fetcher, site: Site) -> tuple[list[str], list[s
     listed, bad = [], []
     for line in site.robots.site_maps() or []:
         try:
-            listed.append(urljoin(base, line))
+            url = urljoin(base, line)
         except ValueError:  # e.g. "http://[bad": urljoin rejects malformed hosts
             bad.append(line)
+            continue
+        # Some sites list their llms.txt or a plain-text sitemap here. We read XML sitemaps
+        # only, and warning that a text file "isn't valid sitemap XML" would just confuse.
+        if not urlsplit(url).path.lower().endswith(".txt"):
+            listed.append(url)
     if listed:
         raw_urls, warnings = await collect_sitemap_urls(fetcher, listed)
     else:
@@ -192,7 +232,7 @@ def describe_pages(site: Site, crawl: Crawl) -> list[PageInfo]:
     infos = []
     for url, page in listable.items():
         strip = boilerplate | folder_boilerplate.get(_top_folder(crawl.layout, url), set())
-        title = page_title(page.title, site.name, url, strip)
+        title = page_title(page.title, site.name, url, strip, site.home.title)
         infos.append(PageInfo(url=url, title=title, description=describe(page, title), section=""))
     return infos  # sections are filled in by build_sections
 
@@ -200,6 +240,16 @@ def describe_pages(site: Site, crawl: Crawl) -> list[PageInfo]:
 def _top_folder(layout: SiteLayout, url: str) -> str | None:
     segments = layout.section_segments(url)
     return segments[0] if segments else None
+
+
+def _own_paragraphs(page: Page) -> list[str]:
+    """Paragraphs that may describe the page: none on a hub page (nearly all links).
+
+    A hub's text is teasers for today's items. Its meta description, if any, is stable; its
+    paragraphs aren't, and a description that changed daily would make monitoring store a
+    new version every day.
+    """
+    return [] if page.is_hub else page.paragraphs
 
 
 def _describer(pages: list[Page]) -> Callable[[Page, str], str | None]:
@@ -210,17 +260,29 @@ def _describer(pages: list[Page]) -> Callable[[Page, str], str | None]:
     next choice.
     """
     counts = Counter(
-        text for page in pages for text in {page.description, *page.paragraphs} if text
+        text for page in pages for text in {page.description, *_own_paragraphs(page)} if text
     )
 
     def describe(page: Page, title: str) -> str | None:
-        for text in (page.description, *page.paragraphs):
-            # A description that only repeats the title ("[About](...): About") adds nothing.
-            if text and counts[text] == 1 and _loose(text) not in _loose(title):
+        for text in (page.description, *_own_paragraphs(page)):
+            if text and counts[text] == 1 and not _echoes(text, title):
                 return text
         return None
 
     return describe
+
+
+def _echoes(description: str, title: str) -> bool:
+    """A description that only repeats the title adds nothing: "[About](...): About", or
+    svelte.dev's "[Routing](...): Routing • SvelteKit documentation", the title plus a label.
+
+    A longer remainder is real content ("Sign in to your account - report a change, ...").
+    """
+    if _loose(description) in _loose(title):
+        return True
+    first_part, *rest = TITLE_SEPARATOR.split(description, maxsplit=1)
+    label = rest[0] if rest else ""
+    return _loose(first_part) == _loose(title) and len(label.split()) <= MAX_SITE_NAME_WORDS
 
 
 def _loose(text: str) -> str:
