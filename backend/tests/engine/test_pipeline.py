@@ -846,6 +846,79 @@ def test_a_site_refusing_with_406_and_bot_checks_is_an_error():
         run(FakeSite(routes))
 
 
+def test_docs_on_a_marketing_site_get_their_own_budget():
+    """Regression (Vercel, Linear, Supabase): dozens of shallow marketing pages, linked from
+    every page, outranked the docs, which got 6 of 50 links as a single section."""
+    marketing = [f"/product-{n}" for n in range(40)]
+    areas = ["functions", "storage", "cli"]
+    docs = [f"/docs/{area}/p{n}" for area in areas for n in range(12)]
+    routes = {
+        f"{ORIGIN}/": home(links=[*marketing, "/docs"]),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in [*marketing, *docs])),
+        f"{ORIGIN}/docs": page("Docs | Acme", links=[f"/docs/{area}/p0" for area in areas]),
+    }
+    routes |= {ORIGIN + p: page(f"{p} | Acme", links=[*marketing, "/docs"]) for p in marketing}
+    routes |= {ORIGIN + path: page(f"{path} | Acme", links=["/docs"]) for path in docs}
+    pages = run(FakeSite(routes)).pages
+    listed_docs = [p.url for p in pages if "/docs/" in p.url]
+    assert len(listed_docs) == rank.MAX_DOCS_PAGES - 1  # plus /docs itself
+    # Spread across the docs' areas, each its own section.
+    assert {p.section for p in pages if "/docs/" in p.url} == {"Functions", "Storage", "CLI"}
+    assert len(pages) == rank.MAX_PAGES  # the rest of the site fills the rest
+
+
+def test_every_area_of_a_scoped_docs_site_gets_its_turn():
+    """Regression (docs.pydantic.dev): the other products filled their 15-link caps and
+    Pydantic Validation got none."""
+    other = "https://other.com"
+    products = ("ai", "logfire", "httpx", "monty")  # 4 x 15 links would fill all 50
+    big = [f"/docs/{product}/p{n}" for product in products for n in range(20)]
+    small = [f"/docs/validation/p{n}" for n in range(4)]
+    routes = {
+        f"{ORIGIN}/": redirect(f"{other}/docs/"),
+        f"{other}/docs/": home(links=big[:3]),
+        f"{other}/sitemap.xml": urlset(*(other + path for path in [*big, *small])),
+    }
+    routes |= {other + path: page(f"{path} | Acme", links=big) for path in big}  # well linked
+    routes |= {other + path: page(f"{path} | Acme") for path in small}
+    pages = run(FakeSite(routes)).pages
+    assert "Validation" in {p.section for p in pages}
+
+
+def test_without_a_sitemap_the_dominant_folder_is_judged_after_the_crawl():
+    """Regression (hono.dev): the homepage's few links showed no folder holding most of the
+    site, so its biggest folder stayed one capped section."""
+    wiki = [f"/wiki/{area}/p{n}" for area in ("setup", "usage") for n in range(8)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/wiki", "/about", "/pricing"]),
+        f"{ORIGIN}/wiki": page("Wiki | Acme", links=wiki),
+        f"{ORIGIN}/about": page("About | Acme"),
+        f"{ORIGIN}/pricing": page("Pricing | Acme"),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in wiki}
+    sections = {p.section for p in run(FakeSite(routes)).pages}
+    assert {"Setup", "Usage"} <= sections
+
+
+def test_sitemap_folders_nothing_links_to_get_no_turn_to_be_fetched(monkeypatch):
+    """Regression (gov.uk): an even share for each of 41 sitemap folders fetched 1988
+    air-accident reports and tribunal decisions, which then filled sections."""
+    monkeypatch.setattr(crawl, "MAX_PAGES_FETCHED", 12)
+    services = [f"/services/s{n}" for n in range(10)]
+    records = [f"/{folder}/r{n}" for folder in ("reports", "decisions") for n in range(10)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/services", "/about"]),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in [*records, *services])),
+        f"{ORIGIN}/services": page("Services | Acme", links=services),
+        f"{ORIGIN}/about": page("About | Acme"),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in [*services, *records]}
+    site = FakeSite(routes)
+    run(site)
+    assert not any("/reports/" in url or "/decisions/" in url for url in site.requests)
+    assert sum("/services/s" in url for url in site.requests) == 9  # the rest of the budget
+
+
 def test_a_blog_lists_its_posts_not_its_archives():
     """Regression (simonwillison.net): 25 year archives and 15 tag pages, and no posts."""
     years = [f"/{year}/" for year in range(2001, 2026)]

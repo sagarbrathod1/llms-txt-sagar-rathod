@@ -140,14 +140,24 @@ class Crawl:
     async def fetch_best(self, urls: list[str]) -> None:
         """Fetch the most promising of `urls` (from sitemaps) within the page budget.
 
-        Homepage links count as inlinks here, since the homepage is the only page fetched so
-        far. Spread evenly across sections first, so one big area can't use up the budget.
+        Two rounds. First the homepage's own links, its navigation, capped per section so a
+        homepage full of stories can't use up the budget. Then the rest, ranked with the links
+        those pages add (Ranker.pick_to_fetch): docs first, round-robin across the folders the
+        fetched pages link into, so one big area can't use up the budget and a folder only the
+        sitemap knows about (gov.uk's air-accident reports) gets no turn.
         """
-        candidates = [url for url in dict.fromkeys(urls) if self.should_fetch(url)]
-        candidates = self.layout.without_version_copies(candidates)
+        nav = self._candidates(self.home.links)
         ranker = self.ranker()
         budget = self.max_pages - len(self.attempted)
-        await self._fetch_all(ranker.pick_spread(ranker.rank(candidates), budget))
+        await self._fetch_all(ranker.pick(ranker.rank(nav), budget, MAX_PAGES_PER_SECTION))
+        candidates = self._candidates(urls)
+        ranker = self.ranker()
+        budget = self.max_pages - len(self.attempted)
+        await self._fetch_all(ranker.pick_to_fetch(ranker.rank(candidates), budget))
+
+    def _candidates(self, urls: list[str]) -> list[str]:
+        candidates = [url for url in dict.fromkeys(urls) if self.should_fetch(url)]
+        return self.layout.without_version_copies(candidates)
 
     async def follow_links(self, start_urls: list[str]) -> None:
         """Breadth-first crawl over same-origin links, starting from start_urls as level 1.

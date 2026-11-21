@@ -45,6 +45,10 @@ MIN_URLS_FOR_DEEPER_GROUPING = 10
 # a site whose pages are mostly posts should list a few, not dozens (nodejs.org's blog).
 # Listing folders (/tags/, see LISTING_SEGMENTS) aren't either.
 ARCHIVE_FOLDERS = {"articles", "blog", "changelog", "news", "posts", "press", "releases"}
+# Top folders that hold documentation. On a mixed site the docs are what an agent needs most,
+# yet as one folder they got a single 15-page section next to dozens of marketing pages
+# (Vercel, Linear, Supabase), so they're grouped deeper and get a budget of their own.
+DOC_FOLDERS = {"api", "doc", "docs", "documentation", "guide", "guides", "learn", "reference"}
 # Dated content (news, posts) changes daily; listing it would make the monitored llms.txt
 # churn even when nothing that matters changed. /2026/11/... or a date-stamped slug.
 YEAR = re.compile(r"^(19|20)\d{2}$")
@@ -97,6 +101,9 @@ class SiteLayout:
     # A top folder holding most of the site (MDN's "docs"): its pages are grouped one level
     # deeper, by /docs/<folder>/, so it doesn't become one giant section.
     dominant_folder: str | None = None
+    # The crawl is scoped to a docs folder (docs.pydantic.dev -> pydantic.dev/docs/), so every
+    # page is documentation. Its top folders are already the docs' own areas.
+    docs_scope: bool = False
 
     @classmethod
     def detect(cls, home: Page, site_name: str, urls: list[str], base: str = "/") -> "SiteLayout":
@@ -131,8 +138,17 @@ class SiteLayout:
             home_locale=home_locale,
             other_locales=frozenset(folders - {home_locale}),
             brand_words=frozenset(brand),
+            docs_scope=any(segment in DOC_FOLDERS for segment in kept),
         )
-        return replace(layout, dominant_folder=layout._dominant_folder(urls))
+        return layout.with_urls(urls)
+
+    def with_urls(self, urls: list[str]) -> "SiteLayout":
+        """This layout with its dominant folder judged from `urls`.
+
+        Called again after a crawl that followed links: without a sitemap, the homepage's
+        links alone (15 on hono.dev) are too few to show which folder holds most of the site.
+        """
+        return replace(self, dominant_folder=self._dominant_folder(urls))
 
     def _dominant_folder(self, urls: list[str]) -> str | None:
         """The top folder holding most of the site's pages, if one does."""
@@ -166,9 +182,22 @@ class SiteLayout:
         """segments() without docs-version folders, which never make good section names."""
         return [segment for segment in self.segments(url) if not is_version(segment)]
 
-    def is_in_dominant_folder(self, url: str) -> bool:
+    def deep_folder(self, url: str) -> str | None:
+        """The page's top folder if that folder is grouped one level deeper: the dominant folder,
+        or a docs folder (/docs/, /guide/, /api/, ...). Within a docs scope the top folders are
+        already the docs' areas (/docs/ai/, /docs/logfire/), so none is grouped deeper."""
         segments = self.section_segments(url)
-        return bool(segments) and segments[0] == self.dominant_folder
+        if not segments:
+            return None
+        top = segments[0]
+        if top == self.dominant_folder or (top in DOC_FOLDERS and not self.docs_scope):
+            return top
+        return None
+
+    def is_docs(self, url: str) -> bool:
+        """Documentation: anything in a docs scope, or under a top folder named like docs."""
+        segments = self.section_segments(url)
+        return self.docs_scope or bool(segments) and segments[0] in DOC_FOLDERS
 
     def is_excluded(self, url: str) -> bool:
         """Copies and junk: other versions or languages, build output, login pages."""

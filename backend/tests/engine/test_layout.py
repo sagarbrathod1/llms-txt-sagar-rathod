@@ -120,6 +120,35 @@ def test_archive_folders_are_never_grouped_deeper():
     assert detect(urls=[*tags, "/bliki/a", "/books/b"]).dominant_folder is None
 
 
+def test_dominant_folder_can_be_judged_again_from_more_urls():
+    # Without a sitemap, the homepage's few links show no dominant folder; the crawl's do.
+    layout = detect(urls=["/wiki/a", "/about", "/pricing"])
+    assert layout.dominant_folder is None
+    wiki = [f"{ORIGIN}/wiki/{area}/p{n}" for area in "ab" for n in range(6)]
+    assert layout.with_urls([*wiki, f"{ORIGIN}/about/team"]).dominant_folder == "wiki"
+
+
+def test_docs_folders_are_grouped_deeper():
+    layout = detect()
+    assert layout.deep_folder(f"{ORIGIN}/docs/web/x") == "docs"
+    assert layout.deep_folder(f"{ORIGIN}/guide/essentials") == "guide"
+    assert layout.deep_folder(f"{ORIGIN}/blog/post") is None
+    assert layout.is_docs(f"{ORIGIN}/api/application")
+    assert not layout.is_docs(f"{ORIGIN}/pricing")
+    # A non-docs folder holding most of the site is grouped deeper too, but isn't docs.
+    wiki = SiteLayout(dominant_folder="wiki")
+    assert wiki.deep_folder(f"{ORIGIN}/wiki/a/b") == "wiki"
+    assert not wiki.is_docs(f"{ORIGIN}/wiki/a/b")
+
+
+def test_in_a_docs_scope_every_page_is_docs_and_top_folders_are_its_areas():
+    # docs.pydantic.dev -> pydantic.dev/docs/: /docs/ai/ and /docs/logfire/ are products.
+    layout = SiteLayout.detect(home("/docs/"), "Acme", [], base="/docs/")
+    assert layout.docs_scope
+    assert layout.is_docs(f"{ORIGIN}/docs/ai/capabilities/mcp/")
+    assert layout.deep_folder(f"{ORIGIN}/docs/ai/capabilities/mcp/") is None
+
+
 def test_listing_pages():
     layout = detect()
     listings = ["/tags/python/", "/blog/category/news", "/authors/jo", "/blog/page/2",

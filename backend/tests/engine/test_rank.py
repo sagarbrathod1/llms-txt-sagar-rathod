@@ -62,7 +62,13 @@ def test_section_titles():
 
 def test_section_folders():
     r = ranker()
-    assert r.section_folder(f"{ORIGIN}/docs/intro") == "docs"
+    assert r.section_folder(f"{ORIGIN}/blog/intro") == "blog"
+    assert r.section_folder(f"{ORIGIN}/blog/2024/intro") == "blog"
+    # Docs are grouped one level deeper; pages right under /docs/ stay one section, so a
+    # flat folder (or a link trap in it) is still capped as one.
+    assert r.section_folder(f"{ORIGIN}/docs/web/x") == "docs/web"
+    assert r.section_folder(f"{ORIGIN}/docs/web") == "docs"
+    assert r.section_folder(f"{ORIGIN}/docs") is None
     assert r.section_folder(f"{ORIGIN}/pricing") is None  # top-level: the general section
     assert r.section_folder(f"{ORIGIN}/2024/05/post") is None  # a year is no heading
     assert r.section_folder(f"{ORIGIN}/optional/x") is None  # would clash with ## Optional
@@ -137,9 +143,9 @@ def test_caps_number_of_pages(monkeypatch):
 def test_one_section_cannot_crowd_out_the_rest(monkeypatch):
     monkeypatch.setattr(rank_module, "MAX_PAGES", 6)
     monkeypatch.setattr(rank_module, "MAX_PAGES_PER_SECTION", 2)
-    guides = [f"/guides/g{n}" for n in range(10)]  # boosted, so they'd fill every slot
-    sections = dict(sections_of([*guides, "/blog/a", "/blog/b", "/about", "/team"]))
-    assert len(sections["Guides"]) == 2
+    features = [f"/features/f{n}" for n in range(10)]  # boosted, so they'd fill every slot
+    sections = dict(sections_of([*features, "/blog/a", "/blog/b", "/about", "/team"]))
+    assert len(sections["Features"]) == 2
     assert len(sections["Blog"]) == 2
     assert len(sections["Pages"]) == 2  # top-level pages fill the rest
 
@@ -159,33 +165,50 @@ def test_deeper_grouping_names_sections_by_the_second_folder():
 
 
 def test_version_folders_never_name_a_section():
-    pages = ["/docs/2.x/a", "/docs/2.x/b"]
-    assert ranker().section_folder(f"{ORIGIN}/docs/2.x/a") == "docs"
-    assert [name for name, _ in sections_of(pages)] == ["Docs"]
+    pages = ["/sdk/2.x/a", "/sdk/2.x/b"]
+    assert ranker().section_folder(f"{ORIGIN}/sdk/2.x/a") == "sdk"
+    assert [name for name, _ in sections_of(pages)] == ["SDK"]
 
 
 def test_dominant_folder_is_capped_in_total(monkeypatch):
     monkeypatch.setattr(rank_module, "MAX_PAGES", 7)  # a full file: the cap makes room
-    monkeypatch.setattr(rank_module, "MAX_DOMINANT_FOLDER_PAGES", 4)
-    layout = SiteLayout(dominant_folder="docs")
-    docs = [f"/docs/{area}/p{n}" for area in "abc" for n in range(3)]
-    pages = [*docs, "/blog/x", "/blog/y", "/about"]
+    monkeypatch.setattr(rank_module, "MAX_DEEP_FOLDER_PAGES", 4)
+    layout = SiteLayout(dominant_folder="wiki")  # not docs, so it has no budget of its own
+    wiki = [f"/wiki/{area}/p{n}" for area in "abc" for n in range(3)]
+    pages = [*wiki, "/blog/x", "/blog/y", "/about"]
     listed = [url for _, urls in sections_of(pages, layout=layout) for url in urls]
-    assert sum(url.startswith("/docs/") for url in listed) == 4
+    assert sum(url.startswith("/wiki/") for url in listed) == 4
     assert {"/blog/x", "/blog/y", "/about"} <= set(listed)
 
 
 def test_pick_spread_reaches_small_sections_then_fills_the_budget():
     r = ranker()
     big = [f"{ORIGIN}/components/c{n}" for n in range(20)]  # ranked first
-    small = [f"{ORIGIN}/{area}/x" for area in ("layout", "forms", "utilities")]
-    picked = r.pick_spread([*big, *small], 8)
-    assert set(small) <= set(picked)  # each section got its share first
-    assert len(picked) == 8  # and the rest of the budget was filled
+    small = [f"{ORIGIN}/{area}/{page}" for area in ("layout", "forms", "utilities")
+             for page in ("x", "y")]  # fmt: skip
+    picked = r.pick_spread([*big, *small], 10, 10)
+    assert set(small) <= set(picked)  # each section got its turns first
+    assert len(picked) == 10  # and the rest of the budget was filled
+
+
+def test_pick_spread_gives_a_lone_page_its_turn_with_its_parent_section():
+    r = ranker()
+    web = [f"{ORIGIN}/docs/web/{page}" for page in "abcd"]  # an area: "docs/web"
+    leaves = [f"{ORIGIN}/docs/config", f"{ORIGIN}/docs/deploy"]  # one page each: "docs"
+    assert r.pick_spread([*web, *leaves], 4, 4) == [web[0], leaves[0], web[1], leaves[1]]
+
+
+def test_old_versions_and_listing_pages_only_fill_what_is_left():
+    r = ranker()
+    current = [f"{ORIGIN}/docs/web/{page}" for page in "abc"]
+    demoted = [f"{ORIGIN}/docs/2.x/old/a", f"{ORIGIN}/docs/2.x/old/b",
+               f"{ORIGIN}/tags/x", f"{ORIGIN}/tags/y"]  # fmt: skip
+    assert r.pick_spread([*demoted, *current], 3, 3) == current
+    assert len(r.pick_spread([*demoted, *current], 5, 5)) == 5
 
 
 def test_dominant_cap_gives_slots_back_when_nothing_else_needs_them(monkeypatch):
-    monkeypatch.setattr(rank_module, "MAX_DOMINANT_FOLDER_PAGES", 4)
+    monkeypatch.setattr(rank_module, "MAX_DEEP_FOLDER_PAGES", 4)
     layout = SiteLayout(dominant_folder="docs")
     docs = [f"/docs/{area}/p{n}" for area in "abc" for n in range(3)]
     listed = [url for _, urls in sections_of(docs, layout=layout) for url in urls]
@@ -218,3 +241,51 @@ def test_listing_pages_are_capped_and_dated_posts_fill_in_but_only_a_few():
     assert sum(url.startswith("/tags/") for url in listed) == rank_module.MAX_LISTING_PAGES
     assert not set(years) & set(listed)  # a date archive ranks below other listings
     assert sum(url in posts for url in listed) == rank_module.MAX_DATED_PAGES
+
+
+def test_docs_get_first_claim_on_the_budget(monkeypatch):
+    monkeypatch.setattr(rank_module, "MAX_PAGES", 6)
+    monkeypatch.setattr(rank_module, "MAX_DOCS_PAGES", 3)
+    marketing = [f"/product-{n}" for n in range(10)]
+    docs = ["/docs/start", "/docs/api/a", "/docs/api/b"]
+    # Shallow marketing pages linked from every page outrank the docs...
+    inlinks = {ORIGIN + url: 10 for url in marketing}
+    listed = [url for _, urls in sections_of([*marketing, *docs], inlinks=inlinks) for url in urls]
+    # ...but the docs get their budget first, and the rest of the site gets the rest.
+    assert set(docs) <= set(listed) and len(listed) == 6
+
+
+def test_docs_areas_take_turns_at_every_level(monkeypatch):
+    monkeypatch.setattr(rank_module, "MAX_DOCS_PAGES", 4)
+    monkeypatch.setattr(rank_module, "MAX_PAGES", 4)
+    guides = [f"/docs/guides/{area}/p{n}" for area in ("auth", "storage") for n in range(5)]
+    reference = [f"/docs/reference/{lang}/p{n}" for lang in ("js", "py") for n in range(5)]
+    # The guides rank first, but each area at each level gets a turn before any gets two.
+    inlinks = {ORIGIN + url: 5 for url in guides}
+    listed = {u for _, urls in sections_of([*guides, *reference], inlinks=inlinks) for u in urls}
+    assert {url.split("/")[3] for url in listed} == {"auth", "storage", "js", "py"}
+
+
+def test_a_lone_docs_page_joins_docs_and_the_docs_landing_heads_its_own_section():
+    pages = ["/docs", "/docs/web/a", "/docs/web/b", "/docs/css/a", "/docs/css/b", "/team"]
+    assert sections_of(pages) == [
+        ("Docs", ["/docs"]),  # alone, but its areas are sections of their own
+        ("CSS", ["/docs/css/a", "/docs/css/b"]),
+        ("Web", ["/docs/web/a", "/docs/web/b"]),
+        ("Pages", ["/team"]),
+    ]
+    assert sections_of(["/docs/cli", "/docs/seo", "/docs/web/a", "/docs/web/b"]) == [
+        ("Docs", ["/docs/cli", "/docs/seo"]),  # one-page areas join their parent
+        ("Web", ["/docs/web/a", "/docs/web/b"]),
+    ]
+
+
+def test_fetching_skips_turns_for_folders_nothing_links_to():
+    linked = [f"{ORIGIN}/products/p{n}" for n in range(5)]
+    records = [f"{ORIGIN}/records/r{n}" for n in range(5)]
+    r = ranker(inlinks={f"{ORIGIN}/products/p0": 1})
+    # The records rank first (discovery order), but only linked folders take turns.
+    picked = r.pick_to_fetch([*records, *linked], 5)
+    assert picked == [*linked]
+    # With nothing linked at all (an app's empty homepage), every folder takes turns.
+    assert len(set(ranker().pick_to_fetch([*records, *linked], 4)) & set(records)) == 2
