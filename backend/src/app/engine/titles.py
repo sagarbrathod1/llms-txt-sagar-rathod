@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from urllib.parse import unquote, urlsplit
 
+from app.engine.layout import ID_SEGMENT
 from app.engine.models import PageInfo
 
 # How titles join a page name and a site name: "Pricing | Acme", "Acme - Docs", "</> htmx ~ Docs",
@@ -13,13 +14,6 @@ from app.engine.models import PageInfo
 TITLE_SEPARATOR = re.compile(r"\s+[|\-–—·•:»~]+\s+")
 # File extensions that say nothing in a title made from a URL ("intro.html" -> "Intro").
 PAGE_EXTENSION = re.compile(r"\.(html?|php|aspx?|jsp)$", re.IGNORECASE)
-# Path segments that are database IDs, not words: UUIDs, hex hashes (with at least one digit,
-# so words like "facade" stay), and long numbers (/news/1030441/...). Four-digit numbers are
-# kept: they're usually years, which make useful hints.
-ID_SEGMENT = re.compile(
-    r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^(?=[a-f]*\d)[0-9a-f]{8,}$|^\d{5,}$",
-    re.IGNORECASE,
-)
 # Homepage title parts that are never the site's name, and prefixes that aren't part of it.
 GENERIC_TITLE_PARTS = {"home", "homepage", "home page", "index", "welcome"}
 GENERIC_PREFIX = re.compile(r"^(welcome to|home of)\b\s*", re.IGNORECASE)
@@ -137,6 +131,15 @@ def page_title(
     """
     if title:
         says_nothing = {_comparable(site_name), _comparable(home_title or site_name)}
+        if home_title and _comparable(title) == _comparable(home_title):
+            # The homepage's own title, made of site-wide parts, so shared parts would strip it
+            # down to a brand fragment ("Acme • The app for widgets" -> "Acme"). Only the site
+            # name comes off; if nothing else is left, the URL names the page (an app shell).
+            # semver.org/spec carries "Semantic Versioning 2.0.0 | Semantic Versioning" too.
+            rest = _strip_symbol_words(_strip_ends(title, {_comparable(site_name)}))
+            if rest and _comparable(rest) not in says_nothing:
+                return rest
+            return title_from_path(url)
         title = _strip_symbol_words(_strip_ends(title, says_nothing | shared_parts))
         if title and _comparable(title) not in says_nothing:  # "</> Docs" -> "Docs" above
             return title
@@ -169,9 +172,11 @@ def title_from_path(url: str) -> str:
 
 
 def _is_code(segment: str) -> bool:
-    """An ID, SKU or page number ("BK212", "2", a UUID) rather than words: no run of three
-    letters, or an ID_SEGMENT."""
-    return bool(ID_SEGMENT.match(segment)) or not re.search(r"[^\W\d_]{3}", segment)
+    """An ID, SKU or page number ("BK212", "2", a UUID) rather than words: digits and no run
+    of three letters, or an ID_SEGMENT. Short words without digits ("ai", "ux") are words."""
+    if ID_SEGMENT.match(segment):
+        return True
+    return any(c.isdigit() for c in segment) and not re.search(r"[^\W\d_]{3}", segment)
 
 
 def add_path_hints(

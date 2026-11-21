@@ -51,6 +51,13 @@ MONTH = re.compile(
     r"^(0?[1-9]|1[0-2]|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february"
     r"|march|april|june|july|august|september|october|november|december)$"
 )  # /2026/11/... and /2026/nov/... (the Guardian)
+# Path segments that are database IDs, not words: UUIDs, hex hashes (with at least one digit,
+# so words like "facade" stay), and long numbers (/news/1030441/...). Four-digit numbers are
+# kept: they're usually years, which make useful hints.
+ID_SEGMENT = re.compile(
+    r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^(?=[a-f]*\d)[0-9a-f]{8,}$|^\d{5,}$",
+    re.IGNORECASE,
+)
 DATE_IN_SLUG = re.compile(r"(19|20)\d{2}[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
 
 
@@ -191,6 +198,11 @@ class SiteLayout:
         """The page with docs-version folders removed: /docs/3.0.1/intro and /docs/intro match."""
         kept = [segment for segment in self.segments(url) if not is_version(segment)]
         return "/".join(kept) + "?" + urlsplit(url).query
+
+    def is_item(self, url: str) -> bool:
+        """A post, story or record: a dated URL, or one with an ID in its path
+        (/news/1038597/..., /careers/<uuid>). Sites add these daily."""
+        return self.is_dated(url) or any(ID_SEGMENT.match(s) for s in path_segments(url))
 
     def is_dated(self, url: str) -> bool:
         segments = self.segments(url)

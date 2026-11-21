@@ -7,6 +7,7 @@ from app.engine.titles import (
     page_title,
     shared_title_parts,
     site_name_from_title,
+    title_from_path,
 )
 
 ORIGIN = "https://example.com"
@@ -198,3 +199,31 @@ def test_og_site_name_that_is_just_the_hostname_is_skipped():
     assert choose_site_name("fastht.ml", [], title, "fastht.ml") == "FastHTML"
     assert choose_site_name("www.Acme.com", [], "Acme | Widgets", "www.acme.com") == "Acme"
     assert choose_site_name("fastht.ml", [], None, "fastht.ml") == "fastht.ml"
+
+
+def test_a_page_titled_exactly_like_the_homepage_falls_back_even_without_the_site_name():
+    """Regression: an app shell titled "Acme • The app for widgets" with og:site_name "Acme Inc"
+    gave "Acme (Dashboard)" while the warning said titles came from the URLs."""
+    shell = "Acme • The app for widgets"
+    shared = {"acme", "the app for widgets"}  # every shell page carries both parts
+    url = f"{ORIGIN}/dashboard"
+    assert page_title(shell, "Acme Inc", url, shared, home_title=shell) == "Dashboard"
+    # ...but what's left after the site name still names the page (semver.org/spec).
+    spec = "Semantic Versioning 2.0.0 | Semantic Versioning"
+    url = f"{ORIGIN}/spec/v2.0.0.html"
+    assert (
+        page_title(spec, "Semantic Versioning", url, home_title=spec) == "Semantic Versioning 2.0.0"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/solutions/ai", "Ai"),  # short words without digits are words
+        ("/changelog/page/2", "Page"),  # a page number is a code
+        ("/product/wolverine-way/BK212.html", "Wolverine way"),  # so is a SKU
+        ("/careers/069c4628-88d7-4e4d-b393-c996fc7f3076", "Careers"),  # and a UUID
+    ],
+)
+def test_path_titles_skip_codes_but_not_short_words(path, expected):
+    assert title_from_path(f"{ORIGIN}{path}") == expected
