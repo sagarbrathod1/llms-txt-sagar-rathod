@@ -26,7 +26,8 @@ export function progressLine(job: ActiveJob): string {
   if (job.pages_discovered === 0) return "Finding pages…";
   // Every planned page is read, but the job is still running: it's ranking and writing the file.
   if (job.pages_crawled >= job.pages_discovered) return "Writing llms.txt…";
-  return `${job.pages_crawled} of ${job.pages_discovered} pages read`;
+  // No "of N": while following links, N is the crawl's page budget, not the site's size.
+  return `${job.pages_crawled} pages read`;
 }
 
 // 0 to 1. The engine guarantees crawled/discovered never goes backwards, so this can feed a bar
@@ -36,8 +37,9 @@ export function progressFraction(job: ActiveJob): number {
   return Math.min(1, job.pages_crawled / job.pages_discovered);
 }
 
-// A run this page watched from start to finish, so its outcome can be reported ("Updated", "No
-// changes"). previousVersionId is the latest version when the run started.
+// A run this page saw while it was active (from its start, or from a load mid-run) and then saw
+// finish, so its outcome can be reported ("Updated", "No changes"). previousVersionId is the
+// latest version while the run was active: versions only change when a run finishes.
 export type WatchedRun = { jobId: string; previousVersionId: string | null };
 
 // One segment of the status line. `at` is rendered as a relative time after `text`.
@@ -56,17 +58,23 @@ export type SiteStatus = {
 // The status line for a site that has a file: how it's monitored, and what the latest run did.
 export function siteStatus(site: Site, watched: WatchedRun | null): SiteStatus {
   const job = site.latest_job;
+  const version = site.latest_version;
   const schedule = site.monitor_enabled
     ? checkSchedule(site.check_interval_hours)
     : "Not checked automatically";
   const parts: StatusPart[] = [{ text: schedule }];
-  const lastChanged: StatusPart | null = site.latest_version
-    ? { text: "Last changed", at: site.latest_version.created_at }
+  // With one version the file has never changed, so "Generated" is the honest label.
+  const changed: StatusPart | null = version
+    ? { text: site.versions.length > 1 ? "Last changed" : "Generated", at: version.created_at }
     : null;
+  // The run that saved the latest version also set last_checked_at, to the same timestamp (one
+  // transaction). Then "Last checked" would repeat the time "Last changed"/"Generated" shows.
+  const lastChecked = site.last_checked_at;
+  const checkedSeparately = lastChecked !== null && lastChecked !== version?.created_at;
   let failure: string | null = null;
 
-  // Only the latest job's outcome is known, and only when this page watched it start.
-  // A first generation (no previous version) has no "updated" to report: the file just appears.
+  // The outcome is known only for the latest job, and only if this page saw it active. A first
+  // generation (no previous version) has no "updated" to report: the file just appears.
   const outcomeKnown =
     watched !== null && job?.id === watched.jobId && watched.previousVersionId !== null;
 
@@ -74,17 +82,25 @@ export function siteStatus(site: Site, watched: WatchedRun | null): SiteStatus {
     parts.push({ text: "Checking for updates…" });
   } else if (job?.status === "failed") {
     failure = job.error ?? UNKNOWN_FAILURE;
-    parts.push({ text: "Last check failed", at: job.finished_at ?? undefined });
-    if (lastChanged) parts.push(lastChanged);
-  } else if (outcomeKnown && site.latest_version?.id !== watched.previousVersionId) {
+    // The count also grows when a manual run fails, so this states the fact without claiming it
+    // is why monitoring is off. A site refused by the monitoring cap has no failures, so it
+    // reads differently: just "Not checked automatically".
+    const failures = site.consecutive_failures;
+    parts.push(
+      failures > 1
+        ? { text: `Last ${failures} checks failed` }
+        : { text: "Last check failed", at: job.finished_at ?? undefined },
+    );
+    if (changed) parts.push(changed);
+  } else if (outcomeKnown && version?.id !== watched.previousVersionId) {
     // "Updated" already says when it last changed.
-    parts.push({ text: "Updated", at: site.latest_version?.created_at });
+    parts.push({ text: "Updated", at: version?.created_at });
   } else if (outcomeKnown) {
     parts.push({ text: "No changes · checked", at: site.last_checked_at ?? undefined });
-    if (lastChanged) parts.push(lastChanged);
+    if (changed) parts.push(changed);
   } else {
-    if (site.last_checked_at) parts.push({ text: "Last checked", at: site.last_checked_at });
-    if (lastChanged) parts.push(lastChanged);
+    if (checkedSeparately) parts.push({ text: "Last checked", at: lastChecked });
+    if (changed) parts.push(changed);
   }
 
   return { parts, checking: isActive(job), failure, canResume: !site.monitor_enabled };

@@ -60,6 +60,30 @@ export function useSite(siteId: string) {
     };
   }, [siteId, showSite, showLoadError]);
 
+  // A tab left open would otherwise show "Last checked yesterday" forever, ageing as if live.
+  // Re-read the site whenever the tab becomes visible again, unless a job is being polled (that
+  // already keeps the page current). A failed refresh is ignored: the data on screen is still
+  // valid, and the next visit tries again.
+  const jobIsActive = site !== null && isActive(site.latest_job);
+  useEffect(() => {
+    if (jobIsActive) return;
+    let ignore = false;
+    function refresh() {
+      if (document.visibilityState !== "visible") return;
+      getSite(siteId).then(
+        (next) => {
+          if (!ignore) showSite(next);
+        },
+        () => {},
+      );
+    }
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      ignore = true;
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [jobIsActive, siteId, showSite]);
+
   // Poll the active job. The effect depends on the job id only, so progress updates don't restart
   // it; it ends when the job finishes (the reloaded site then has a finished latest_job), on a
   // permanent error, or on unmount. The version a run started from changes only when the run

@@ -6,11 +6,6 @@ export function formatDate(iso: string): string {
   return new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
-// The day only, e.g. "Nov 18, 2026".
-export function formatDay(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, { dateStyle: "medium" });
-}
-
 // English to match the rest of the copy; numeric: "auto" gives "yesterday" rather than "1 day ago".
 const relative = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
 

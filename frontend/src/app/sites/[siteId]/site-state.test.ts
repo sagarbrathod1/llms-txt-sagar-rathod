@@ -92,7 +92,7 @@ describe("progress", () => {
   it.each([
     ["queued", active({ status: "queued" }), "Getting started…", 0],
     ["nothing found yet", active({}), "Finding pages…", 0],
-    ["crawling", active({ pages_discovered: 100, pages_crawled: 42 }), "42 of 100 pages read", 0.42],
+    ["crawling", active({ pages_discovered: 100, pages_crawled: 42 }), "42 pages read", 0.42],
     ["writing", active({ pages_discovered: 30, pages_crawled: 30 }), "Writing llms.txt…", 1],
   ])("%s", (_, j, line, fraction) => {
     expect(progressLine(j)).toBe(line);
@@ -103,15 +103,29 @@ describe("progress", () => {
 describe("siteStatus", () => {
   const texts = (s: ReturnType<typeof siteStatus>) =>
     s.parts.map((p) => (p.at ? `${p.text} @${p.at}` : p.text));
+  const twoVersions = { versions: [V2, VERSION].map(({ id, created_at }) => ({ id, created_at })) };
 
-  it("shows the schedule, last check and last change at rest", () => {
+  it("shows the schedule, last check and when it was generated at rest", () => {
     const status = siteStatus(site(job({}), VERSION, { last_checked_at: CHECKED }), null);
     expect(texts(status)).toEqual([
       "Checked daily",
       `Last checked @${CHECKED}`,
-      `Last changed @${VERSION.created_at}`,
+      `Generated @${VERSION.created_at}`,
     ]);
     expect(status).toMatchObject({ checking: false, failure: null, canResume: false });
+  });
+
+  it("says Last changed once there is more than one version", () => {
+    const s = site(job({}), V2, { last_checked_at: "2026-11-22T00:00:00Z", ...twoVersions });
+    expect(texts(siteStatus(s, null))).toContain(`Last changed @${V2.created_at}`);
+  });
+
+  it("doesn't repeat the time when the last check is the run that made the file", () => {
+    const s = site(job({}), VERSION, { last_checked_at: VERSION.created_at });
+    expect(texts(siteStatus(s, null))).toEqual([
+      "Checked daily",
+      `Generated @${VERSION.created_at}`,
+    ]);
   });
 
   it("shows a running check without hiding anything else", () => {
@@ -121,8 +135,11 @@ describe("siteStatus", () => {
   });
 
   it("says Updated when a watched run produced a new version", () => {
-    const status = siteStatus(site(job({}), V2), { jobId: "j1", previousVersionId: "v1" });
-    expect(texts(status)).toEqual(["Checked daily", `Updated @${V2.created_at}`]);
+    const s = site(job({}), V2, { last_checked_at: V2.created_at, ...twoVersions });
+    expect(texts(siteStatus(s, { jobId: "j1", previousVersionId: "v1" }))).toEqual([
+      "Checked daily",
+      `Updated @${V2.created_at}`,
+    ]);
   });
 
   it("says No changes when a watched run kept the same version", () => {
@@ -130,7 +147,7 @@ describe("siteStatus", () => {
     expect(texts(siteStatus(s, { jobId: "j1", previousVersionId: "v1" }))).toEqual([
       "Checked daily",
       `No changes · checked @${CHECKED}`,
-      `Last changed @${VERSION.created_at}`,
+      `Generated @${VERSION.created_at}`,
     ]);
   });
 
@@ -143,19 +160,32 @@ describe("siteStatus", () => {
 
   it("keeps the last file on a failed check and says why", () => {
     const failed = job({ status: "failed", error: "Timed out.", finished_at: CHECKED });
-    const status = siteStatus(site(failed, VERSION), null);
+    const status = siteStatus(site(failed, VERSION, { consecutive_failures: 1 }), null);
     expect(texts(status)).toEqual([
       "Checked daily",
       `Last check failed @${CHECKED}`,
-      `Last changed @${VERSION.created_at}`,
+      `Generated @${VERSION.created_at}`,
     ]);
     expect(status.failure).toBe("Timed out.");
   });
 
-  it("offers to resume only when monitoring is off", () => {
-    const status = siteStatus(site(job({}), VERSION, { monitor_enabled: false }), null);
-    expect(status.parts[0].text).toBe("Not checked automatically");
+  it("counts failures in a row, e.g. when they turned monitoring off", () => {
+    const failed = job({ status: "failed", error: "HTTP 503.", finished_at: CHECKED });
+    const s = site(failed, VERSION, { monitor_enabled: false, consecutive_failures: 5 });
+    const status = siteStatus(s, null);
+    expect(texts(status)).toEqual([
+      "Not checked automatically",
+      "Last 5 checks failed",
+      `Generated @${VERSION.created_at}`,
+    ]);
     expect(status.canResume).toBe(true);
+  });
+
+  it("reads differently for a site the monitoring cap left unmonitored", () => {
+    const s = site(job({}), VERSION, { monitor_enabled: false, last_checked_at: VERSION.created_at });
+    const status = siteStatus(s, null);
+    expect(texts(status)).toEqual(["Not checked automatically", `Generated @${VERSION.created_at}`]);
+    expect(status).toMatchObject({ failure: null, canResume: true });
   });
 });
 

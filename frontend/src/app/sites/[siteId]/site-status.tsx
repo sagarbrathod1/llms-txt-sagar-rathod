@@ -46,7 +46,8 @@ export function SiteStatusLine(props: Props) {
                   </>
                 )}
               </span>
-              {/* Right after "Not checked automatically", the part it changes. */}
+              {/* Right after "Not checked automatically", the part it changes. Not "Check daily":
+                  next to "Checked daily" and "Check now", that read as a status. */}
               {i === 0 && status.canResume && (
                 <>
                   <span aria-hidden>·</span>
@@ -56,7 +57,7 @@ export function SiteStatusLine(props: Props) {
                     disabled={resuming}
                     onClick={resumeMonitoring}
                   >
-                    Check daily
+                    Turn on daily checks
                   </button>
                 </>
               )}
