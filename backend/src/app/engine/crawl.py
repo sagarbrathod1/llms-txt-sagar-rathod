@@ -10,7 +10,13 @@ from app.engine.extract import Page, parse_page
 from app.engine.fetch import MAX_PAGE_BYTES, USER_AGENT, DeadlineError, Fetcher, FetchError
 from app.engine.layout import SiteLayout
 from app.engine.models import GenerationError, Progress
-from app.engine.rank import MAX_PAGES_PER_SECTION, Ranker, in_other_language, inlink_counts
+from app.engine.rank import (
+    FETCH_CAPS,
+    MAX_PAGES_PER_SECTION,
+    Ranker,
+    in_other_language,
+    inlink_counts,
+)
 from app.engine.titles import TITLE_SEPARATOR
 from app.engine.urls import normalize_page_url
 
@@ -140,8 +146,9 @@ class Crawl:
     async def fetch_best(self, urls: list[str]) -> None:
         """Fetch the most promising of `urls` (from sitemaps) within the page budget.
 
-        Two rounds. First the homepage's own links, its navigation, capped per section so a
-        homepage full of stories can't use up the budget. Then the rest, ranked with the links
+        Two rounds. First the homepage's own links, its navigation, capped per section and
+        with dated and listing pages capped (FETCH_CAPS), so a homepage full of stories can't
+        use up the budget. Then the rest, ranked with the links
         those pages add (Ranker.pick_to_fetch): docs first, round-robin across the folders the
         fetched pages link into, so one big area can't use up the budget and a folder only the
         sitemap knows about (gov.uk's air-accident reports) gets no turn.
@@ -149,11 +156,17 @@ class Crawl:
         nav = self._candidates(self.home.links)
         ranker = self.ranker()
         budget = self.max_pages - len(self.attempted)
-        await self._fetch_all(ranker.pick(ranker.rank(nav), budget, MAX_PAGES_PER_SECTION))
+        caps = FETCH_CAPS
+        await self._fetch_all(
+            ranker.pick(ranker.rank(nav), budget, MAX_PAGES_PER_SECTION, caps=caps)
+        )
         candidates = self._candidates(urls)
         ranker = self.ranker()
         budget = self.max_pages - len(self.attempted)
-        await self._fetch_all(ranker.pick_to_fetch(ranker.rank(candidates), budget))
+        # The fetch caps cover both rounds: what round one fetched counts toward them.
+        fetched = Counter(kind for url in self.attempted for kind in ranker.kinds(url))
+        caps = {kind: cap - fetched[kind] for kind, cap in FETCH_CAPS.items()}
+        await self._fetch_all(ranker.pick_to_fetch(ranker.rank(candidates), budget, caps))
 
     def _candidates(self, urls: list[str]) -> list[str]:
         """URLs worth fetching: none already tried, even spelled differently (the sitemap's
@@ -229,7 +242,10 @@ class Crawl:
         # Judged again after redirects: python.org's /accounts/ redirects to a login page
         # (/accounts/login/?next=...), which the URL we asked for didn't show.
         if self.layout.is_excluded(final_url):
-            self.skipped[url] = "redirects to a login page, a translation or another version"
+            self.skipped[url] = (
+                "redirects to a page this crawl leaves out (a login page, a translation, "
+                "another docs version or another part of the site)"
+            )
             return None
         try:
             # Parsing is CPU work (tens of ms for a big page), so it runs on the parse thread.

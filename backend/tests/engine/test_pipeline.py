@@ -971,7 +971,7 @@ def test_a_page_that_redirects_to_a_login_page_is_left_out():
     }
     result = run(FakeSite(routes))
     assert "Sign in" not in result.llms_txt
-    assert any("redirects to a login page" in w for w in result.warnings)
+    assert any("redirects to a page this crawl leaves out" in w for w in result.warnings)
 
 
 def test_a_page_fetched_from_the_homepage_is_not_fetched_again_from_the_sitemap():
@@ -986,4 +986,42 @@ def test_a_page_fetched_from_the_homepage_is_not_fetched_again_from_the_sitemap(
     routes |= {url: page(f"Page {url[-2:]} | Acme") for url in docs}
     site = FakeSite(routes)
     run(site)
-    assert sum(url.startswith(f"{ORIGIN}/docs") and len(url) <= 25 for url in site.requests) == 1
+    assert sum(url in (f"{ORIGIN}/docs", f"{ORIGIN}/docs/") for url in site.requests) == 1
+
+
+def test_a_stores_guides_do_not_get_the_docs_budget():
+    """Review repro: a store's /guides/ (size charts) took 30 of 50 links before the products
+    were ranked. Only a folder named like docs, linked from the homepage and holding a real
+    share of the site, gets that budget."""
+    guides = [
+        f"/guides/{area}/g{n}" for area in ("size-fit", "care", "layering") for n in range(10)
+    ]
+    products = [f"/product-{n}" for n in range(40)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/guides", *products]),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in [*guides, *products])),
+        f"{ORIGIN}/guides": page("Guides | Acme", links=guides),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme", links=products) for path in products}
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in guides}
+    urls = [p.url.removeprefix(ORIGIN) for p in run(FakeSite(routes)).pages]
+    assert sum(url in products for url in urls) > sum(url in guides for url in urls)
+
+
+def test_a_homepage_full_of_stories_cannot_use_up_the_fetch_budget(monkeypatch):
+    """Review repro (Ars Technica): 160 dated story links on the homepage took 94 of 99
+    fetches, though at most 5 can be listed, and the sitemap's evergreen pages weren't
+    reached."""
+    monkeypatch.setattr(crawl, "MAX_PAGES_FETCHED", 30)
+    stories = [f"/2026/11/{day:02}/story-{n}" for day in range(1, 21) for n in range(2)]
+    sections = [f"/sections/s{n}" for n in range(15)]
+    routes = {
+        f"{ORIGIN}/": home(links=stories),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in sections)),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in [*stories, *sections]}
+    site = FakeSite(routes)
+    run(site)
+    fetched_stories = sum(any(url.endswith(path) for path in stories) for url in site.requests)
+    assert fetched_stories == 2 * rank.MAX_DATED_PAGES  # FETCH_CAPS
+    assert all(ORIGIN + path in site.requests for path in sections)

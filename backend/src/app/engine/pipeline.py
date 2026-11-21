@@ -106,7 +106,7 @@ async def run(
         await crawl.follow_links(site.home.links + sitemap_urls)
         # Without a sitemap, only now are there enough URLs to see which folder holds most of
         # the site.
-        crawl.layout = layout.with_urls(sorted(crawl.discovered))
+        crawl.layout = layout.with_urls(sorted(crawl.discovered), site.home.links)
     crawl.raise_if_unusable()
 
     sections = crawl.ranker().build_sections(describe_pages(site, crawl))

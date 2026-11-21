@@ -191,7 +191,7 @@ def test_pick_spread_reaches_small_sections_then_fills_the_budget():
     assert len(picked) == 10  # and the rest of the budget was filled
 
 
-def test_pick_spread_gives_a_lone_page_its_turn_with_its_parent_section():
+def test_pick_spread_takes_each_folders_best_page_then_sections_take_turns():
     r = ranker()
     web = [f"{ORIGIN}/docs/web/{page}" for page in "abcd"]  # an area: "docs/web"
     leaves = [f"{ORIGIN}/docs/config", f"{ORIGIN}/docs/deploy"]  # one page each: "docs"
@@ -220,10 +220,11 @@ def test_policy_pages_with_extensions_brand_names_or_in_other_languages():
     for path in ["/privacy-notice.html", "/terms-of-use.html", "/web-accessibility.html",
                  "/datenschutz-spiegel", "/nutzungsbedingungen", "/barrierefreiheit", "/agb",
                  "/mentions-l%C3%A9gales", "/aviso-legal", "/aup", "/dpa",
-                 "/legal/acceptable-use-policy", "/help/terms-conditions"]:  # fmt: skip
+                 "/legal/acceptable-use-policy", "/help/terms-conditions",
+                 "/data-processing-addendum"]:  # fmt: skip
         assert r.is_low_value(ORIGIN + path), path
     for path in ["/spiegel", "/stories.html", "/docs/privacy-features", "/datenschutz-tools/x",
-                 "/tags/privacy.html"]:  # fmt: skip
+                 "/tags/privacy.html", "/services/data-processing"]:  # fmt: skip
         assert not r.is_low_value(ORIGIN + path), path
 
 
@@ -248,22 +249,64 @@ def test_docs_get_first_claim_on_the_budget(monkeypatch):
     monkeypatch.setattr(rank_module, "MAX_DOCS_PAGES", 3)
     marketing = [f"/product-{n}" for n in range(10)]
     docs = ["/docs/start", "/docs/api/a", "/docs/api/b"]
+    layout = SiteLayout(docs_folders=frozenset({"docs"}))
     # Shallow marketing pages linked from every page outrank the docs...
     inlinks = {ORIGIN + url: 10 for url in marketing}
-    listed = [url for _, urls in sections_of([*marketing, *docs], inlinks=inlinks) for url in urls]
-    # ...but the docs get their budget first, and the rest of the site gets the rest.
+    pages = [*marketing, *docs]
+    listed = [u for _, urls in sections_of(pages, inlinks=inlinks, layout=layout) for u in urls]
+    # ...but the site's docs get their budget first, and the rest of the site gets the rest.
     assert set(docs) <= set(listed) and len(listed) == 6
+    # A folder only named like docs, without the evidence (layout.docs_folders), doesn't.
+    listed = [u for _, urls in sections_of(pages, inlinks=inlinks) for u in urls]
+    assert not set(docs) & set(listed)
 
 
-def test_docs_areas_take_turns_at_every_level(monkeypatch):
+def test_every_docs_folder_gets_its_best_page_in_before_the_rest(monkeypatch):
     monkeypatch.setattr(rank_module, "MAX_DOCS_PAGES", 4)
     monkeypatch.setattr(rank_module, "MAX_PAGES", 4)
+    # A docs scope (docs.supabase.com -> supabase.com/docs/): guides and reference are its areas.
+    layout = SiteLayout(scope="/docs/", strict_scope=True, docs_scope=True)
     guides = [f"/docs/guides/{area}/p{n}" for area in ("auth", "storage") for n in range(5)]
     reference = [f"/docs/reference/{lang}/p{n}" for lang in ("js", "py") for n in range(5)]
-    # The guides rank first, but each area at each level gets a turn before any gets two.
+    # The guides rank first, but each area gets its best page in before any gets two.
     inlinks = {ORIGIN + url: 5 for url in guides}
-    listed = {u for _, urls in sections_of([*guides, *reference], inlinks=inlinks) for u in urls}
+    pages = [*guides, *reference]
+    listed = {u for _, urls in sections_of(pages, inlinks=inlinks, layout=layout) for u in urls}
     assert {url.split("/")[3] for url in listed} == {"auth", "storage", "js", "py"}
+
+
+def test_a_flat_folder_gives_one_page_to_the_turns_and_the_rest_by_rank():
+    """Review repro (Supabase): every turn of a flat folder of endpoints gave its next page
+    in alphabetical order (a tie), crowding out the SDK intros next to it."""
+    layout = SiteLayout(scope="/docs/", strict_scope=True, docs_scope=True)
+    r = ranker(inlinks={f"{ORIGIN}/docs/reference/api/v1-zz-popular": 9}, layout=layout)
+    endpoints = [f"{ORIGIN}/docs/reference/api/v1-{name}" for name in ("aa", "bb", "zz-popular")]
+    intros = [f"{ORIGIN}/docs/reference/{lang}/intro" for lang in ("js", "py", "go")]
+    ranked = r.rank([*endpoints, *intros])
+    picked = r.pick_spread(ranked, 5, 5)
+    assert set(intros) <= set(picked)  # each folder's best page
+    assert endpoints[2] in picked and not {endpoints[0], endpoints[1]} <= set(picked)
+
+
+def test_turns_stop_at_a_fixed_folder_depth():
+    # Folders below ROUND_ROBIN_DEPTH take no turns of their own: they count as their ancestor.
+    segments = SiteLayout().section_segments
+    deep = "/".join("abcdef"[: rank_module.ROUND_ROBIN_DEPTH])
+    first, second = f"{ORIGIN}/{deep}/x/page", f"{ORIGIN}/{deep}/y/page"
+    other = f"{ORIGIN}/other/page"
+    assert rank_module._folder_leaders([first, second, other], segments) == [first, other]
+    # ...which also means a site's absurdly deep URLs can't exhaust the recursion.
+    absurd = ORIGIN + "/a" * 5000
+    assert rank_module._folder_leaders([absurd], segments) == [absurd]
+
+
+def test_categories_rank_like_listings_but_are_not_capped_with_them():
+    # A magazine's /category/<name>/ pages are its sections (WordPress's default).
+    categories = [f"/category/c{n}/" for n in range(8)]
+    tags = [f"/tag/t{n}/" for n in range(8)]
+    listed = [url for _, urls in sections_of([*categories, *tags, "/about"]) for url in urls]
+    assert set(categories) <= set(listed)
+    assert sum(url in tags for url in listed) == rank_module.MAX_LISTING_PAGES
 
 
 def test_a_lone_docs_page_joins_docs_and_the_docs_landing_heads_its_own_section():

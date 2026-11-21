@@ -8,6 +8,7 @@ those copies would crowd the real pages out of llms.txt, so this module identifi
 import re
 from collections import Counter
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from app.engine.extract import Page
@@ -25,8 +26,9 @@ ISO_639_1 = set(
 )
 # A language code with an optional region or script: en, en-us, pt_BR, zh-hans, es-419.
 LOCALE = re.compile(r"^([a-z]{2})(?:[-_]([a-z]{2,4}|\d{3}))?$")
-# A version folder: 2.x, 3.0.1, v2, 2.0.0-alpha.30.
-VERSION = re.compile(r"^v?\d+(\.[\w-]+)+$|^v\d+$")
+# A version folder: 2.x, 3.0.1, v2, 2.0.0-alpha.30, and API versions named by date, 2025-04 or
+# 2024-06-20 (Pinecone, Stripe), each a whole copy of the API reference.
+VERSION = re.compile(r"^v?\d+(\.[\w-]+)+$|^v\d+$|^(19|20)\d{2}-\d{2}(-\d{2})?$")
 # Names docs sites give their moving versions. Each is a whole copy of the docs.
 VERSION_ALIASES = {"latest", "stable", "next", "current", "nightly", "canary", "unreleased"}
 # Build output of docs generators (Sphinx's _modules, _sources, genindex) and search pages:
@@ -45,10 +47,17 @@ MIN_URLS_FOR_DEEPER_GROUPING = 10
 # a site whose pages are mostly posts should list a few, not dozens (nodejs.org's blog).
 # Listing folders (/tags/, see LISTING_SEGMENTS) aren't either.
 ARCHIVE_FOLDERS = {"articles", "blog", "changelog", "news", "posts", "press", "releases"}
-# Top folders that hold documentation. On a mixed site the docs are what an agent needs most,
-# yet as one folder they got a single 15-page section next to dozens of marketing pages
-# (Vercel, Linear, Supabase), so they're grouped deeper and get a budget of their own.
+# Top folders named like documentation are grouped one level deeper, so docs with areas get
+# a section per area rather than one 15-link "Docs" (Vercel, Supabase, Hono).
 DOC_FOLDERS = {"api", "doc", "docs", "documentation", "guide", "guides", "learn", "reference"}
+# The names that mean documentation and little else. Only these can be the site's docs, which
+# get a budget of their own (rank.MAX_DOCS_PAGES): "guides" and "learn" are just as often
+# buying guides or a blog (Patagonia's /guides/ size charts).
+DOCS_NAMES = {"api", "doc", "docs", "documentation", "reference"}
+# ...and only when the homepage links into the folder and it holds at least this share of the
+# site's URLs. Measured: docs folders hold 10-90% (Linear 10%, Vercel 44%, Hono 75%); folders
+# that only share the name, under 1% (simonwillison.net's /guides/, 18 of 3,645 URLs).
+MIN_DOCS_SHARE = 0.05
 # Dated content (news, posts) changes daily; listing it would make the monitored llms.txt
 # churn even when nothing that matters changed. /2026/11/... or a date-stamped slug.
 YEAR = re.compile(r"^(19|20)\d{2}$")
@@ -66,9 +75,13 @@ ID_SEGMENT = re.compile(
 )
 # Listing pages that only repeat links to other pages.
 LISTING_SEGMENTS = {"archive", "archives", "author", "authors", "category", "categories",
-                    "page", "tag", "tags"}  # fmt: skip
-# Query parameters for page 2, 3, ... of a listing.
-PAGE_PARAMS = {"p", "page", "paged"}
+                    "tag", "tags"}  # fmt: skip
+# Categories are also a blog's or magazine's sections (WordPress's /category/<name>/), so
+# they're ranked like listings but not capped with them (see rank.MAX_LISTING_PAGES).
+CATEGORY_SEGMENTS = {"category", "categories"}
+# Page 2, 3, ... of a listing: /blog/page/2, ?page=3, ?paged=3. Only with a number: a
+# ?page=about is a page of its own, and WordPress's ?p=123 is a post.
+PAGE_PARAMS = {"page", "paged"}
 DATE_IN_SLUG = re.compile(r"(19|20)\d{2}[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
 
 
@@ -104,6 +117,8 @@ class SiteLayout:
     # The crawl is scoped to a docs folder (docs.pydantic.dev -> pydantic.dev/docs/), so every
     # page is documentation. Its top folders are already the docs' own areas.
     docs_scope: bool = False
+    # Top folders that are the site's docs (see DOCS_NAMES), e.g. {"docs"}.
+    docs_folders: frozenset[str] = frozenset()
 
     @classmethod
     def detect(cls, home: Page, site_name: str, urls: list[str], base: str = "/") -> "SiteLayout":
@@ -138,17 +153,33 @@ class SiteLayout:
             home_locale=home_locale,
             other_locales=frozenset(folders - {home_locale}),
             brand_words=frozenset(brand),
-            docs_scope=any(segment in DOC_FOLDERS for segment in kept),
+            docs_scope=any(segment in DOCS_NAMES for segment in kept),
         )
-        return layout.with_urls(urls)
+        return layout.with_urls(urls, home.links)
 
-    def with_urls(self, urls: list[str]) -> "SiteLayout":
-        """This layout with its dominant folder judged from `urls`.
+    def with_urls(self, urls: list[str], home_links: list[str]) -> "SiteLayout":
+        """This layout with its dominant folder and docs folders judged from `urls`.
 
         Called again after a crawl that followed links: without a sitemap, the homepage's
         links alone (15 on hono.dev) are too few to show which folder holds most of the site.
         """
-        return replace(self, dominant_folder=self._dominant_folder(urls))
+        return replace(
+            self,
+            dominant_folder=self._dominant_folder(urls),
+            docs_folders=self._docs_folders(urls, home_links),
+        )
+
+    def _docs_folders(self, urls: list[str], home_links: list[str]) -> frozenset[str]:
+        """Top folders named like docs (DOCS_NAMES) that the homepage links into and that hold
+        at least MIN_DOCS_SHARE of the site's URLs: evidence the site treats them as its docs."""
+        tops = [self._top(url) for url in urls if not self.is_excluded(url)]
+        linked = {self._top(url) for url in home_links if not self.is_excluded(url)}
+        counts = Counter(top for top in tops if top in DOCS_NAMES & linked)
+        return frozenset(top for top, n in counts.items() if n >= len(tops) * MIN_DOCS_SHARE)
+
+    def _top(self, url: str) -> str | None:
+        segments = self.section_segments(url)
+        return segments[0] if segments else None
 
     def _dominant_folder(self, urls: list[str]) -> str | None:
         """The top folder holding most of the site's pages, if one does."""
@@ -195,9 +226,8 @@ class SiteLayout:
         return None
 
     def is_docs(self, url: str) -> bool:
-        """Documentation: anything in a docs scope, or under a top folder named like docs."""
-        segments = self.section_segments(url)
-        return self.docs_scope or bool(segments) and segments[0] in DOC_FOLDERS
+        """The site's docs: anything in a docs scope, or under one of its docs_folders."""
+        return self.docs_scope or self._top(url) in self.docs_folders
 
     def is_excluded(self, url: str) -> bool:
         """Copies and junk: other versions or languages, build output, login pages."""
@@ -245,9 +275,15 @@ class SiteLayout:
         segments = self.segments(url)
         if any(segment in LISTING_SEGMENTS for segment in segments):
             return True
-        if any(key.lower() in PAGE_PARAMS for key, _ in parse_qsl(urlsplit(url).query)):
+        if any(page == "page" and number.isdigit() for page, number in pairwise(segments)):
+            return True
+        query = parse_qsl(urlsplit(url).query)
+        if any(key.lower() in PAGE_PARAMS and value.isdigit() for key, value in query):
             return True
         return self.is_date_archive(url)
+
+    def is_category(self, url: str) -> bool:
+        return any(segment in CATEGORY_SEGMENTS for segment in self.segments(url))
 
     def is_date_archive(self, url: str) -> bool:
         """A path ending in a year (and maybe a month and day): /2002/, /blog/2024/05/.

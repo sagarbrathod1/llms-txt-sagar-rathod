@@ -22,15 +22,18 @@ MAX_PAGES = 50
 # One area (a blog, a guides library) can have hundreds of pages that all score alike. Capping
 # each section at under a third of MAX_PAGES leaves room for the rest of the site.
 MAX_PAGES_PER_SECTION = 15
-# Folders grouped one level deeper (the one holding most of the site, like MDN's /docs/, and
-# docs folders) are capped in total, so their subsections can't push everything else out.
+# Folders grouped one level deeper (the one holding most of the site, and folders named like
+# docs) are capped in total, so their subsections can't push everything else out. The site's
+# docs have their own cap of the same size (MAX_DOCS_PAGES).
 MAX_DEEP_FOLDER_PAGES = 30
-# Docs are what an agent needs most: they get the first claim on this many of the MAX_PAGES
-# links, before the rest of the site is ranked. Without it, a marketing site's dozens of
-# shallow, well-linked pages outranked the docs (Vercel listed 6 docs pages, Linear 6).
+# Docs are what an agent needs most: the site's docs (layout.is_docs: a folder named like docs
+# that the homepage links into and that holds a real share of the site) get the first claim
+# on this many of the MAX_PAGES links, before the rest of the site is ranked. Without it, a
+# marketing site's dozens of shallow, well-linked pages outranked the docs (Vercel 6, Linear 6).
 MAX_DOCS_PAGES = MAX_DEEP_FOLDER_PAGES
-# Tag, category, author, archive and page-2 pages only repeat links to other pages; a few
-# show how the site is organized (simonwillison.net listed 25 year archives and 15 tags).
+# Tag, author, archive and page-2 pages only repeat links to other pages; a few show how the
+# site is organized (simonwillison.net listed 25 year archives and 15 tags). Categories rank
+# like them but aren't capped: on a blog or magazine they're the sections.
 MAX_LISTING_PAGES = 3
 # Dated posts and stories churn: each new one would change the monitored file. They rank
 # below evergreen pages, and at most this many are listed, the ones the site links to most,
@@ -81,20 +84,24 @@ LOW_VALUE_SEGMENTS = {
 # /privacy-security, /accessibility-policy, /cookie-preferences, /web-accessibility. Whole
 # slugs only, so /legal-services, /cookie-recipes or /careers-advice stay content.
 POLICY_SLUG = re.compile(
-    r"^((web|website|site)-)?(acceptable-use|accessibility|cookies?|data-processing|gdpr|legal"
-    r"|privacy|terms)"
+    r"^((web|website|site)-)?(acceptable-use|accessibility|cookies?|gdpr|legal|privacy|terms"
+    r"|data-processing(?=-addendum|-agreement))"
     r"(-(addendum|agreement|and|center|centre|conditions|info|information|notice|of|policies"
     r"|policy|preferences|security|service|settings|statement|use))*$"
 )
 # File extensions some sites keep in their URLs (Patagonia's /privacy-notice.html).
 PAGE_EXTENSION = re.compile(r"\.(aspx?|html?|jsp|php)$")
 # Folders of job postings: /careers/<posting> is one job, /careers itself the list of them.
-JOB_FOLDERS = {"career", "careers", "job", "jobs"}
-# Folder levels that take turns in _round_robin; deeper folders are details of details.
+JOB_FOLDERS = {"careers", "jobs"}
+# Folder levels that take turns in _folder_leaders. Deeper folders count as their ancestor:
+# that bounds the recursion, and pages that deep are details of details.
 ROUND_ROBIN_DEPTH = 6
 # Kinds of page capped in total across sections (Ranker.kinds).
-DEEP, LISTING, DATED, JOB = "deep", "listing", "dated", "job"
+DOCS, DEEP, LISTING, DATED, JOB = "docs", "deep", "listing", "dated", "job"
 MAIN_CAPS = {LISTING: MAX_LISTING_PAGES, DATED: MAX_DATED_PAGES}
+# While fetching: twice as many as can be listed (as MAX_PAGES_FETCHED is twice MAX_PAGES), so
+# a homepage of 160 stories can't spend the budget on pages that can't be listed (Ars Technica).
+FETCH_CAPS = {kind: 2 * cap for kind, cap in MAIN_CAPS.items()}
 # Words in section names that are abbreviations despite containing vowels.
 ACRONYMS = {"ai", "api", "cli", "eu", "faq", "ios", "seo", "til", "ui", "uk", "url", "us"}
 
@@ -191,30 +198,40 @@ class Ranker:
         caps: Mapping[str, int] | None = None,
         already: Sequence[str] = (),
     ) -> list[str]:
-        """Pick round-robin across sections, then fill any room left by rank.
+        """Pick so that a budget covers a site's areas before going deep into any one of them.
 
-        Round-robin: folders take turns at every level of the URL tree, so the pick covers
-        a site's areas before going deep into any one of them (see _round_robin). With a
-        per-section cap alone, a few big sections used the whole budget and smaller ones
-        (Bootstrap's Layout, Forms, Utilities; Cursor's CLI docs) were never reached.
-        Only sections in `sections` (default: all) take turns. Old docs versions, listing
-        pages and dated posts never do; they can only fill what's left. `already` continues
-        an earlier pick, as in pick().
+        1. The best page of every folder, folders taking turns level by level
+           (_folder_leaders): every docs area's landing page, every SDK's intro.
+        2. Then sections take turns, rank order within each, so the next pages spread across
+           sections too (Cursor's CLI and SDK docs next to its 12 integrations).
+        3. Then anything left, by rank.
+        With a per-section cap alone, a few big sections used the whole budget and smaller
+        ones (Pydantic's Validation docs, Cursor's CLI) were never reached. Only sections in
+        `sections` (default: all) take turns. Old docs versions, listing pages and dated posts
+        never do; they can only fill what's left. `already` continues an earlier pick, as in
+        pick().
         """
         eligible = [
             url for url in ranked
             if (sections is None or self.section_folder(url) in sections)
             and not self.layout.is_versioned(url)
-            and not self.kinds(url) & {LISTING, DATED}
+            and not self.layout.is_listing(url)
+            and not self.layout.is_dated(url)
         ]  # fmt: skip
-        round_robin = _round_robin(eligible, self.layout.section_segments)
-        taken = self.pick(round_robin, limit, per_section, already, caps)
+        leaders = _folder_leaders(eligible, self.layout.section_segments)
+        by_section: dict[str | None, list[str]] = {}
+        for url in eligible:  # rank order, so each section's queue is too
+            by_section.setdefault(self.section_folder(url), []).append(url)
+        turns = [*leaders, *_interleave(list(by_section.values()))]
+        taken = self.pick(turns, limit, per_section, already, caps)
         return self.pick(ranked, limit, per_section, already=taken, caps=caps)
 
-    def pick_to_fetch(self, ranked: list[str], limit: int) -> list[str]:
-        """Pick sitemap pages to fetch, the way build_sections will pick from them: docs
-        first (up to MAX_DOCS_PAGES), then the rest, each round-robin across the sections the
-        fetched pages link into, then by rank.
+    def pick_to_fetch(
+        self, ranked: list[str], limit: int, caps: Mapping[str, int] | None = None
+    ) -> list[str]:
+        """Pick sitemap pages to fetch, the way build_sections will pick from them: the
+        site's docs first (up to MAX_DOCS_PAGES), then the rest, each with pick_spread over
+        the sections the fetched pages link into. `caps` limits kinds of pages (FETCH_CAPS).
 
         Top-level pages and folders the fetched pages link into (their landing page or any
         page in them) take turns; folders only a sitemap knows about don't: gov.uk's sitemap
@@ -231,15 +248,20 @@ class Ranker:
         sections = {f for f in sections if f is None or f.split("/")[0] in linked}
         sections = sections if linked else None
         docs = [url for url in ranked if self.layout.is_docs(url)]
-        taken = self.pick_spread(docs, min(limit, MAX_DOCS_PAGES), limit, sections)
-        return self.pick_spread(ranked, limit, limit, sections, already=taken)
+        docs_limit = min(limit, MAX_DOCS_PAGES)
+        taken = self.pick_spread(docs, docs_limit, per_section=limit, sections=sections, caps=caps)
+        return self.pick_spread(
+            ranked, limit, per_section=limit, sections=sections, caps=caps, already=taken
+        )
 
     def kinds(self, url: str) -> set[str]:
         """The kinds of page `url` is that are capped in total (see the MAX_*_PAGES caps)."""
         kinds = set()
-        if self.layout.deep_folder(url):
+        if self.layout.is_docs(url):
+            kinds.add(DOCS)
+        elif self.layout.deep_folder(url):
             kinds.add(DEEP)
-        if self.layout.is_listing(url):
+        if self.layout.is_listing(url) and not self.layout.is_category(url):
             kinds.add(LISTING)
         if self.layout.is_dated(url):
             kinds.add(DATED)
@@ -328,7 +350,7 @@ class Ranker:
         )
 
         groups: dict[str | None, list[str]] = {}
-        for url in main:  # rank order, so each group's first URL is its best
+        for url in self.rank(main):  # rank order, so each group's first URL is its best
             groups.setdefault(self.section_folder(url), []).append(url)
         # A docs area too small to stand alone (a lone /docs/web/x) joins its parent, "docs".
         self._merge_small_groups(groups, subsections=True)
@@ -373,16 +395,16 @@ class Ranker:
     def pick_main(self, regular: list[str]) -> list[str]:
         """The pages for the main sections, from `regular` in rank order.
 
-        1. Docs first, up to MAX_DOCS_PAGES, round-robin across their areas (pick_spread), so
-           one big area can't take them all.
-        2. Then the rest of the site by rank, with deep folders capped in total, so their
-           subsections can't crowd out everything else.
+        1. The site's docs first (layout.is_docs), up to MAX_DOCS_PAGES: every docs folder's
+           best page, then the rest by rank (pick_spread), so one big area can't take them all.
+        2. Then the rest of the site by rank, with the docs and the other deep folders each
+           capped in total, so their subsections can't crowd out everything else.
         3. Then any room left by rank, without that cap (a site that's almost all docs).
         Listing and dated pages are capped throughout.
         """
         docs = [url for url in regular if self.layout.is_docs(url)]
         main = self.pick_spread(docs, MAX_DOCS_PAGES, MAX_PAGES_PER_SECTION, caps=MAIN_CAPS)
-        caps = MAIN_CAPS | {DEEP: MAX_DEEP_FOLDER_PAGES}
+        caps = MAIN_CAPS | {DOCS: MAX_DOCS_PAGES, DEEP: MAX_DEEP_FOLDER_PAGES}
         main = self.pick(regular, MAX_PAGES, MAX_PAGES_PER_SECTION, already=main, caps=caps)
         return self.pick(regular, MAX_PAGES, MAX_PAGES_PER_SECTION, already=main, caps=MAIN_CAPS)
 
@@ -402,38 +424,43 @@ def _has_subsections(groups: dict[str | None, list[str]], folder: str) -> bool:
     return any(other and other.startswith(folder + "/") for other in groups)
 
 
-def _round_robin(ranked: list[str], segments: Callable[[str], list[str]]) -> list[str]:
-    """`ranked` reordered so that folders take turns, at every level of the URL tree.
+def _folder_leaders(ranked: list[str], segments: Callable[[str], list[str]]) -> list[str]:
+    """The best page of every folder in `ranked`, folders taking turns level by level.
 
-    In each folder, the queues are its own pages (its landing page and the pages directly in
-    it) and each subfolder, ordered the same way recursively. The queues give one page per
-    turn: /docs/guides/auth, /docs/reference/javascript, then /docs/guides/database, ... A
-    subfolder with a single page joins its parent's own pages, as build_sections will place
-    it. Queues go in the order of their best page, so within a round it's still rank order.
-    Below ROUND_ROBIN_DEPTH folders, pages simply queue in rank order: that bounds the
-    recursion, whatever URLs a site links to.
+    In each folder, the turns go to its own best page (usually its landing page) and to each
+    subfolder, which takes its turns the same way: /docs/guides/auth, /docs/reference/js,
+    /docs/guides/database, /docs/reference/python, ... Each folder gives only its best page,
+    so a flat folder of near-identical pages (Supabase's API endpoints) never takes turn
+    after turn with its alphabetical tail; what's left follows in rank order (pick_spread).
+    Turns go in the order of each one's best page, so within a round it's still rank order.
+    Only the top folder levels take turns (ROUND_ROBIN_DEPTH): deeper pages count as pages of
+    their ancestor folder, which also bounds the recursion whatever URLs a site links to.
     """
     position = {url: index for index, url in enumerate(ranked)}
     paths = {url: tuple(segments(url)[:ROUND_ROBIN_DEPTH]) for url in ranked}
     folders = {path[:depth] for path in paths.values() for depth in range(len(path))}
-    # A page lives in its parent folder, or in its own path if other pages are under it:
-    # /docs/cli is the landing page of /docs/cli/.
-    home = {url: path if path in folders else path[:-1] for url, path in paths.items()}
-    size = Counter(home[url][:depth] for url in ranked for depth in range(len(home[url]) + 1))
+    own: dict[tuple[str, ...], list[str]] = {}  # each folder's own pages, in rank order
+    for url, path in paths.items():
+        # A page lives in its parent folder, or in its own path if other pages are under it:
+        # /docs/cli is the landing page of /docs/cli/.
+        own.setdefault(path if path in folders else path[:-1], []).append(url)
+    subfolders: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+    for folder in own:
+        for depth in range(len(folder)):
+            subfolders.setdefault(folder[:depth], set()).add(folder[: depth + 1])
 
-    def order(folder: tuple[str, ...], urls: list[str]) -> list[str]:
-        queues: dict[tuple[str, ...], list[str]] = {}  # filled in rank order
-        for url in urls:
-            child = home[url][: len(folder) + 1]
-            alone = len(child) > len(folder) and size[child] >= MIN_SECTION_SIZE
-            queues.setdefault(child if alone else folder, []).append(url)
-        turns = [order(queue, members) if queue != folder else members
-                 for queue, members in queues.items()]  # fmt: skip
-        turns.sort(key=lambda queue: position[queue[0]])
-        return [queue[turn] for turn in range(max(map(len, turns), default=0))
-                for queue in turns if turn < len(queue)]  # fmt: skip
+    def leaders(folder: tuple[str, ...]) -> list[str]:
+        turns = [own[folder][:1]] if folder in own else []
+        turns += [leaders(sub) for sub in subfolders.get(folder, ())]
+        return _interleave(sorted(turns, key=lambda turn: position[turn[0]]))
 
-    return order((), ranked)
+    return leaders(()) if ranked else []
+
+
+def _interleave(queues: list[list[str]]) -> list[str]:
+    """Round-robin: the first of each queue, then the second of each, and so on."""
+    return [queue[n] for n in range(max(map(len, queues), default=0))
+            for queue in queues if n < len(queue)]  # fmt: skip
 
 
 def _is_policy_name(segment: str) -> bool:

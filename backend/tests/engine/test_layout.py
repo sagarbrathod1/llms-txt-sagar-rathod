@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from app.engine.extract import Page
 from app.engine.layout import SiteLayout, is_locale, is_version
 
@@ -20,7 +22,8 @@ def test_locale_and_version_segments():
     assert all(is_locale(s) for s in ["en", "en-US", "pt_br", "zh-hans", "es-419"])
     assert not any(is_locale(s) for s in ["ai", "go", "tv", "docs", "eng"])
     assert all(is_version(s) for s in ["2.x", "3.0.1", "v2", "2.0.0-alpha.30", "latest", "stable"])
-    assert not any(is_version(s) for s in ["docs", "2026", "v", "web3"])
+    assert all(is_version(s) for s in ["2025-04", "2024-06-20"])  # dated API versions
+    assert not any(is_version(s) for s in ["docs", "2026", "v", "web3", "2026-blog", "1999-2001"])
 
 
 def test_version_scope_is_strict():
@@ -125,7 +128,7 @@ def test_dominant_folder_can_be_judged_again_from_more_urls():
     layout = detect(urls=["/wiki/a", "/about", "/pricing"])
     assert layout.dominant_folder is None
     wiki = [f"{ORIGIN}/wiki/{area}/p{n}" for area in "ab" for n in range(6)]
-    assert layout.with_urls([*wiki, f"{ORIGIN}/about/team"]).dominant_folder == "wiki"
+    assert layout.with_urls([*wiki, f"{ORIGIN}/about/team"], []).dominant_folder == "wiki"
 
 
 def test_docs_folders_are_grouped_deeper():
@@ -133,12 +136,33 @@ def test_docs_folders_are_grouped_deeper():
     assert layout.deep_folder(f"{ORIGIN}/docs/web/x") == "docs"
     assert layout.deep_folder(f"{ORIGIN}/guide/essentials") == "guide"
     assert layout.deep_folder(f"{ORIGIN}/blog/post") is None
-    assert layout.is_docs(f"{ORIGIN}/api/application")
-    assert not layout.is_docs(f"{ORIGIN}/pricing")
     # A non-docs folder holding most of the site is grouped deeper too, but isn't docs.
     wiki = SiteLayout(dominant_folder="wiki")
     assert wiki.deep_folder(f"{ORIGIN}/wiki/a/b") == "wiki"
     assert not wiki.is_docs(f"{ORIGIN}/wiki/a/b")
+
+
+def detect_with_home_links(home_links, urls):
+    page = replace(home(), links=[ORIGIN + path for path in home_links])
+    return SiteLayout.detect(page, "Acme", [ORIGIN + path for path in urls])
+
+
+def test_the_sites_docs_need_a_docs_name_a_homepage_link_and_a_real_share_of_the_site():
+    docs = [f"/docs/area/p{n}" for n in range(10)]
+    products = [f"/products/p{n}" for n in range(90)]
+    layout = detect_with_home_links(["/docs", "/products"], [*docs, *products])
+    assert layout.docs_folders == {"docs"}
+    assert layout.is_docs(f"{ORIGIN}/docs/area/p1")
+    assert not layout.is_docs(f"{ORIGIN}/products/p1")
+    # Not linked from the homepage: the site doesn't present it as its docs.
+    assert not detect_with_home_links(["/products"], [*docs, *products]).docs_folders
+    # Under 5% of the site's URLs: a /reference/ style guide on a big site.
+    big = [f"/news/p{n}" for n in range(400)]
+    assert not detect_with_home_links(["/docs"], [*docs, *big]).docs_folders
+    # "guides" can be a store's size charts: grouped deeper, but never the site's docs.
+    guides = [f"/guides/g{n}" for n in range(30)]
+    store = detect_with_home_links(["/guides", "/products"], [*guides, *products])
+    assert not store.docs_folders and store.deep_folder(f"{ORIGIN}/guides/g1") == "guides"
 
 
 def test_in_a_docs_scope_every_page_is_docs_and_top_folders_are_its_areas():
@@ -152,11 +176,14 @@ def test_in_a_docs_scope_every_page_is_docs_and_top_folders_are_its_areas():
 def test_listing_pages():
     layout = detect()
     listings = ["/tags/python/", "/blog/category/news", "/authors/jo", "/blog/page/2",
-                "/blog?page=3", "/2002/", "/2026/nov/", "/2026/11/20/",
+                "/blog?page=3", "/blog?paged=4", "/2002/", "/2026/nov/", "/2026/11/20/",
                 "/blog/2024/05/"]  # fmt: skip
     for path in listings:
         assert layout.is_listing(ORIGIN + path), path
-    for path in ["/blog/how-to", "/2026/nov/20/a-post/", "/products/1984", "/docs/2024"]:
+    # Pagination only with a number: ?page=about is a page, WordPress's ?p=123 is a post.
+    pages = ["/blog/how-to", "/2026/nov/20/a-post/", "/products/1984", "/docs/2024",
+             "/index.php?page=about", "/?p=123", "/page/about", "/docs/page/intro"]  # fmt: skip
+    for path in pages:
         assert not layout.is_listing(ORIGIN + path), path
 
 
