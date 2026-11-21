@@ -11,13 +11,18 @@ export function GenerateForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function start(siteUrl: string) {
+  // `replace` is for the /?url= path below: there, router.replace("/") may still be pending when
+  // this resolves, and a push would pre-empt it and leave /?url=... in history, so Back would
+  // submit again. Replacing that entry with the site page makes Back skip it entirely.
+  async function start(siteUrl: string, replace = false) {
     setSubmitting(true);
     setError(null);
     try {
       const { site_id } = await createSite(siteUrl.trim());
       // The site page finds the new job through the site's latest_job, so the URL needs no job id.
-      router.push(`/sites/${site_id}`);
+      const sitePage = `/sites/${site_id}`;
+      if (replace) router.replace(sitePage);
+      else router.push(sitePage);
       // submitting stays true on success: the button stays disabled until the next page replaces
       // this one, so a second click can't send another request.
     } catch (err) {
@@ -39,7 +44,7 @@ export function GenerateForm() {
     // this costs is the point, so the box shows what is being generated.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setUrl(pending);
-    void start(pending);
+    void start(pending, true);
     // Runs once, on mount: start reads nothing that changes later.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
