@@ -11,13 +11,18 @@ export function GenerateForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function start(siteUrl: string) {
+  // `replace` is for the /?url= path below: there, router.replace("/") may still be pending when
+  // this resolves, and a push would pre-empt it and leave /?url=... in history, so Back would
+  // submit again. Replacing that entry with the site page makes Back skip it entirely.
+  async function start(siteUrl: string, replace = false) {
     setSubmitting(true);
     setError(null);
     try {
       const { site_id } = await createSite(siteUrl.trim());
       // The site page finds the new job through the site's latest_job, so the URL needs no job id.
-      router.push(`/sites/${site_id}`);
+      const sitePage = `/sites/${site_id}`;
+      if (replace) router.replace(sitePage);
+      else router.push(sitePage);
       // submitting stays true on success: the button stays disabled until the next page replaces
       // this one, so a second click can't send another request.
     } catch (err) {
@@ -39,13 +44,13 @@ export function GenerateForm() {
     // this costs is the point, so the box shows what is being generated.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setUrl(pending);
-    void start(pending);
+    void start(pending, true);
     // Runs once, on mount: start reads nothing that changes later.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
-    <>
+    <div className="mx-auto max-w-lg text-left">
       <form
         action="/"
         onSubmit={(event) => {
@@ -65,24 +70,28 @@ export function GenerateForm() {
           type="text"
           inputMode="url"
           autoComplete="url"
+          autoFocus
           required
           placeholder="example.com"
           value={url}
+          readOnly={submitting}
           onChange={(event) => setUrl(event.target.value)}
           aria-invalid={error !== null}
           aria-describedby={error ? "url-error" : undefined}
-          className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2"
+          className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2 placeholder:text-muted/60 read-only:text-muted"
         />
+        {/* The first request after a quiet period can take a few seconds; the button saying
+            "Generating…" covers that wait without explaining why. */}
         <button type="submit" disabled={submitting} className="btn btn-primary px-4 py-2">
-          {submitting ? "Starting…" : "Generate"}
+          {submitting ? "Generating…" : "Generate"}
         </button>
       </form>
 
       {error && (
-        <p id="url-error" role="alert" className="text-danger">
+        <p id="url-error" role="alert" className="mt-2 text-sm text-danger">
           {error}
         </p>
       )}
-    </>
+    </div>
   );
 }

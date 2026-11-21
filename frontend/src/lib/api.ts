@@ -100,11 +100,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   } catch (err) {
     // Both cases have no HTTP status, so callers treat them as transient.
     if (err instanceof DOMException && err.name === "TimeoutError") {
-      throw new ApiError("The API took too long to answer. Try again shortly.", null);
+      throw new ApiError("This is taking longer than usual. Try again in a moment.", null);
     }
     // Otherwise fetch rejects only when no response arrives: offline, server down, or a CORS
-    // rejection (the browser hides which, so the message names both).
-    throw new ApiError("Could not reach the API (network or CORS problem). Try again shortly.", null);
+    // rejection. The browser hides which, and the user can only retry either way, so the message
+    // stays plain.
+    throw new ApiError("Couldn't connect. Try again in a moment.", null);
   }
   if (!res.ok) {
     throw new ApiError(await errorMessage(res), res.status);

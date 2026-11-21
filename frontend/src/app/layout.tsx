@@ -22,14 +22,13 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
       <body className="min-h-screen bg-background font-sans text-foreground">
-        <header className="border-b border-border">
-          <div className="mx-auto max-w-3xl px-4 py-3">
-            <Link href="/" className="font-semibold">
-              llms.txt generator
-            </Link>
-          </div>
+        {/* No border or nav: the wordmark is the only way home, and the page content leads. */}
+        <header className="mx-auto max-w-2xl px-4 pt-6">
+          <Link href="/" className="font-mono text-sm font-medium">
+            llms.txt
+          </Link>
         </header>
-        <main className="mx-auto max-w-3xl px-4 py-8">{children}</main>
+        <main className="mx-auto max-w-2xl px-4 pt-12 pb-24">{children}</main>
       </body>
     </html>
   );

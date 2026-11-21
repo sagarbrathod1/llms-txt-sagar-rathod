@@ -5,10 +5,12 @@
 :root {
   --background: #ffffff;
   --foreground: #18181b;
-  --muted: #52525b;
-  --surface: #f4f4f5;
-  --border: #d4d4d8;
-  --accent: #1d4ed8;
+  --muted: #71717a;
+  --surface: #fafafa;
+  --border: #e4e4e7;
+  /* Near-black rather than a brand color: the page stays quiet and the one primary button
+     still stands out. */
+  --accent: #18181b;
   --accent-foreground: #ffffff;
   --danger: #b91c1c;
 }
@@ -18,9 +20,9 @@
     --background: #09090b;
     --foreground: #f4f4f5;
     --muted: #a1a1aa;
-    --surface: #18181b;
-    --border: #3f3f46;
-    --accent: #60a5fa;
+    --surface: #111113;
+    --border: #27272a;
+    --accent: #fafafa;
     --accent-foreground: #09090b;
     --danger: #f87171;
   }
@@ -50,6 +52,15 @@
   .btn {
     /* enabled:hover so a disabled button doesn't look clickable on hover. */
     @apply inline-flex items-center justify-center rounded-md border border-border px-3 py-1.5 text-sm font-medium enabled:hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  /* Secondary actions that sit inside a line of text ("Check now", "Copy"): no box, so the
+     page doesn't fill up with buttons. */
+  .btn-text {
+    @apply text-sm text-muted underline-offset-4 enabled:hover:text-foreground enabled:hover:underline disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  /* The same look for links ("Try another site"); links have no :enabled state. */
+  .link-muted {
+    @apply text-sm text-muted underline-offset-4 hover:text-foreground hover:underline;
   }
   .btn-primary {
     /* Repeats bg-accent under enabled:hover to override .btn's hover background. */
