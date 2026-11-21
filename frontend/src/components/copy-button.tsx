@@ -26,7 +26,7 @@ export function CopyButton({ text, label }: Props) {
   const feedback = state === "copied" ? "Copied" : state === "failed" ? "Copy failed" : "";
   return (
     <>
-      <button type="button" onClick={copy} className="btn">
+      <button type="button" onClick={copy} className="btn-text">
         {feedback || label}
       </button>
       {/* Screen readers announce the result from this live region; the button's own name

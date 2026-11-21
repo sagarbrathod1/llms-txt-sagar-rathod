@@ -1,5 +1,5 @@
-// The site page's data: load the site, poll its active job, start a new run, apply a monitoring
-// change. The components only render what this returns.
+// The site page's data: load the site, poll its active job, start a new run, resume monitoring.
+// The components only render what this returns.
 import { useCallback, useEffect, useState } from "react";
 
 import {
@@ -10,31 +10,37 @@ import {
   httpStatus,
   isActive,
   POLL_INTERVAL_MS,
+  setMonitoring,
   type Site,
 } from "@/lib/api";
 
-import { isPermanentPollError } from "./site-state";
-
-// A bad id in the URL comes back as 422 (not a UUID) or 404 (no such site); both mean the same
-// thing to the user.
-function siteErrorText(err: unknown): string {
-  const status = httpStatus(err);
-  return status === 404 || status === 422 ? "Site not found." : errorText(err);
-}
+import { isPermanentPollError, type WatchedRun } from "./site-state";
 
 export function useSite(siteId: string) {
   // The single source of truth: the job shown is always site.latest_job, which polling updates
   // in place.
   const [site, setSite] = useState<Site | null>(null);
+  const [notFound, setNotFound] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pollProblem, setPollProblem] = useState<string | null>(null);
+  const [watched, setWatched] = useState<WatchedRun | null>(null);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
 
   const showSite = useCallback((next: Site) => {
     setSite(next);
     setLoadError(null);
     setPollProblem(null);
+  }, []);
+
+  // A bad id in the URL comes back as 422 (not a UUID) or 404 (no such site); both mean the same
+  // thing to the user.
+  const showLoadError = useCallback((err: unknown) => {
+    const status = httpStatus(err);
+    if (status === 404 || status === 422) setNotFound(true);
+    else setLoadError(errorText(err));
   }, []);
 
   // latest_job tells us the state on first load and after a reload, so the URL needs no job id.
@@ -46,18 +52,20 @@ export function useSite(siteId: string) {
         if (!ignore) showSite(next);
       },
       (err) => {
-        if (!ignore) setLoadError(siteErrorText(err));
+        if (!ignore) showLoadError(err);
       },
     );
     return () => {
       ignore = true;
     };
-  }, [siteId, showSite]);
+  }, [siteId, showSite, showLoadError]);
 
   // Poll the active job. The effect depends on the job id only, so progress updates don't restart
   // it; it ends when the job finishes (the reloaded site then has a finished latest_job), on a
-  // permanent error, or on unmount.
+  // permanent error, or on unmount. The version a run started from changes only when the run
+  // finishes, at which point the job id changes too, so it doesn't restart the effect mid-run.
   const activeJobId = site && isActive(site.latest_job) ? site.latest_job.id : null;
+  const startVersionId = site?.latest_version?.id ?? null;
   useEffect(() => {
     if (activeJobId === null) return;
     let stopped = false;
@@ -78,9 +86,11 @@ export function useSite(siteId: string) {
           }
           // Finished: reload the site for the new version, check times and final job. This is
           // inside the try so a failed reload is retried on the next tick rather than leaving the
-          // progress panel stuck.
+          // progress view stuck.
           const fresh = await getSite(siteId);
           if (stopped) return;
+          // Remembered so the status line can say whether this run changed the file.
+          setWatched({ jobId, previousVersionId: startVersionId });
           showSite(fresh);
           // Defensive: if the site still reports this job as active (e.g. a read that raced the
           // job's final write), keep polling it. A different active job changes activeJobId,
@@ -90,10 +100,10 @@ export function useSite(siteId: string) {
         } catch (err) {
           if (stopped) return;
           if (isPermanentPollError(httpStatus(err))) {
-            setPollProblem(`Stopped checking progress (${errorText(err)}). Reload to try again.`);
+            setPollProblem("Lost track of progress. Reload the page.");
             return;
           }
-          setPollProblem("Lost contact with the server, retrying…");
+          setPollProblem("Reconnecting…");
         }
       }
     }
@@ -102,11 +112,11 @@ export function useSite(siteId: string) {
     return () => {
       stopped = true;
     };
-  }, [activeJobId, siteId, showSite]);
+  }, [activeJobId, startVersionId, siteId, showSite]);
 
-  // Used by both "Try again" and "Re-generate now". POST /sites returns the site's active job if
-  // one exists, so a double click can't start two crawls.
-  async function regenerate() {
+  // "Check now" and "Try again". POST /sites returns the site's active job if one exists, so a
+  // double click can't start two crawls.
+  async function checkNow() {
     if (site === null) return;
     setStarting(true);
     setStartError(null);
@@ -122,25 +132,54 @@ export function useSite(siteId: string) {
     try {
       showSite(await getSite(siteId));
     } catch (err) {
-      setLoadError(siteErrorText(err));
+      showLoadError(err);
     } finally {
       setStarting(false);
     }
   }
 
-  // Merge only the fields PATCH owns. Replacing the whole site would let a slow PATCH response
-  // overwrite a newer latest_job (from a re-generate or poll) and stop polling.
-  const applyMonitoring = useCallback((next: Site) => {
-    setSite(
-      (current) =>
-        current && {
-          ...current,
-          monitor_enabled: next.monitor_enabled,
-          next_check_at: next.next_check_at,
-          consecutive_failures: next.consecutive_failures,
-        },
-    );
-  }, []);
+  // Turns monitoring back on. Only ever on: see SiteStatus.canResume.
+  async function resumeMonitoring() {
+    if (site === null) return;
+    setResuming(true);
+    setResumeError(null);
+    try {
+      const next = await setMonitoring(site.id, true);
+      // Merge only the fields PATCH owns. Replacing the whole site would let a slow response
+      // overwrite a newer latest_job (from Check now or polling) and stop polling.
+      setSite(
+        (current) =>
+          current && {
+            ...current,
+            monitor_enabled: next.monitor_enabled,
+            next_check_at: next.next_check_at,
+            consecutive_failures: next.consecutive_failures,
+          },
+      );
+    } catch (err) {
+      // 409: the monitored-sites cap is full. The API's own message is written for the old
+      // toggle, so this one points at what still works here.
+      setResumeError(
+        httpStatus(err) === 409
+          ? "Daily checks are full right now. Use Check now to refresh it."
+          : errorText(err),
+      );
+    } finally {
+      setResuming(false);
+    }
+  }
 
-  return { site, loadError, pollProblem, starting, startError, regenerate, applyMonitoring };
+  return {
+    site,
+    notFound,
+    loadError,
+    pollProblem,
+    watched,
+    starting,
+    startError,
+    checkNow,
+    resuming,
+    resumeError,
+    resumeMonitoring,
+  };
 }

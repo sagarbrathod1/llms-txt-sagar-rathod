@@ -1,153 +1,149 @@
 "use client";
 
-import { CopyButton } from "@/components/copy-button";
-import { hostedUrl, isActive, type ActiveJob } from "@/lib/api";
-import { formatDate } from "@/lib/format";
+import Link from "next/link";
+
+import { type ActiveJob } from "@/lib/api";
 
 import { LlmsTxtPanel } from "./llms-txt-panel";
-import { Monitoring } from "./monitoring";
-import { siteViewState } from "./site-state";
+import { SiteStatusLine } from "./site-status";
+import { progressFraction, progressLine, siteView } from "./site-state";
 import { useSite } from "./use-site";
 
 export function SiteView({ siteId }: { siteId: string }) {
-  const { site, loadError, pollProblem, starting, startError, regenerate, applyMonitoring } =
-    useSite(siteId);
+  const {
+    site,
+    notFound,
+    loadError,
+    pollProblem,
+    watched,
+    starting,
+    startError,
+    checkNow,
+    resuming,
+    resumeError,
+    resumeMonitoring,
+  } = useSite(siteId);
+
+  if (notFound) {
+    return (
+      <div className="space-y-3">
+        <h1 className="text-xl font-medium">We couldn&apos;t find that site.</h1>
+        <Link href="/" className="link-muted">
+          Generate a new llms.txt →
+        </Link>
+      </div>
+    );
+  }
 
   if (site === null) {
     return loadError ? (
-      <p role="alert" className="text-danger">
-        Could not load this site: {loadError}
+      <p role="alert" className="text-sm text-danger">
+        {loadError}
       </p>
     ) : (
-      <p role="status" className="text-muted">
+      <p role="status" className="text-sm text-muted">
         Loading…
       </p>
     );
   }
 
-  const job = site.latest_job;
-  const { recheckError, failure, canRegenerate } = siteViewState(site);
+  const view = siteView(site);
+  // The site's address without the scheme: shorter, and how people say it.
+  const host = site.url.replace(/^https?:\/\//, "");
 
   return (
     <div className="space-y-8">
       {/* React 19 hoists this into <head>, so each site's tab and history entry are named. */}
-      <title>{`${site.url} · llms.txt generator`}</title>
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 space-y-1">
-          <h1 className="text-2xl font-semibold break-all">{site.url}</h1>
-          <p className="text-sm text-muted">Added {formatDate(site.created_at)}</p>
-        </div>
-        {canRegenerate && (
-          <button type="button" className="btn" disabled={starting} onClick={regenerate}>
-            {starting ? "Starting…" : "Re-generate now"}
-          </button>
+      <title>{`${host} · llms.txt`}</title>
+
+      <div className="space-y-1.5">
+        <h1 className="text-2xl font-medium tracking-tight break-all">
+          <a
+            href={site.url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline-offset-4 hover:underline"
+          >
+            {host}
+          </a>
+        </h1>
+        {view.kind === "ready" && (
+          <SiteStatusLine
+            site={site}
+            watched={watched}
+            pollProblem={pollProblem}
+            starting={starting}
+            startError={startError}
+            checkNow={checkNow}
+            resuming={resuming}
+            resumeError={resumeError}
+            resumeMonitoring={resumeMonitoring}
+          />
         )}
       </div>
 
-      {loadError && (
-        <p role="alert" className="text-danger">
-          Could not refresh this site: {loadError}
-        </p>
-      )}
-      {startError && (
-        <p role="alert" className="text-danger">
-          Could not start a new run: {startError}
-        </p>
-      )}
+      {/* A refresh that failed after the page loaded; the data on screen is still valid. */}
+      {loadError && <p className="text-sm text-muted">{loadError}</p>}
 
-      {isActive(job) && <JobProgress job={job} problem={pollProblem} />}
+      {view.kind === "generating" && <Generating job={view.job} problem={pollProblem} />}
 
-      {failure !== null && (
-        <section className="space-y-3 rounded-md border border-danger p-4">
-          <h2 className="font-semibold text-danger">Generation failed</h2>
-          <p>{failure}</p>
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={starting}
-            onClick={regenerate}
-          >
-            {starting ? "Starting…" : "Try again"}
-          </button>
+      {view.kind === "failed" && (
+        <section className="space-y-4">
+          <div className="space-y-1">
+            <h2 className="font-medium">Couldn&apos;t generate an llms.txt</h2>
+            <p className="text-sm text-muted">{view.error}</p>
+          </div>
+          <div className="flex items-center gap-4">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={starting}
+              onClick={checkNow}
+            >
+              {starting ? "Starting…" : "Try again"}
+            </button>
+            <Link href="/" className="link-muted">
+              Try another site
+            </Link>
+          </div>
+          {startError && (
+            <p role="alert" className="text-sm text-danger">
+              {startError}
+            </p>
+          )}
         </section>
       )}
 
-      {site.latest_version ? (
-        <>
-          {/* key: a new latest version resets the panel back to showing the latest. */}
-          <LlmsTxtPanel key={site.latest_version.id} site={site} latest={site.latest_version} />
-          {job?.status === "succeeded" && job.warnings.length > 0 && (
-            <Warnings warnings={job.warnings} />
-          )}
-          <HostedUrl siteId={site.id} />
-          <Monitoring site={site} onChange={applyMonitoring} recheckError={recheckError} />
-        </>
-      ) : (
-        !isActive(job) &&
-        failure === null && <p className="text-muted">No llms.txt has been generated yet.</p>
+      {view.kind === "ready" && (
+        // key: a new latest version resets the panel back to showing the latest.
+        <LlmsTxtPanel key={view.version.id} site={site} latest={view.version} />
       )}
     </div>
   );
 }
 
-function JobProgress({ job, problem }: { job: ActiveJob; problem: string | null }) {
+function Generating({ job, problem }: { job: ActiveJob; problem: string | null }) {
+  const fraction = progressFraction(job);
   return (
-    <section className="space-y-1 rounded-md border border-border bg-surface p-4">
-      <h2 className="font-semibold">
-        {job.kind === "recheck" ? "Checking the site for changes…" : "Generating llms.txt…"}
-      </h2>
-      {/* Only the phase line is a live region: announcing the counter every 1.5s would be noise. */}
-      <p role="status">
-        {job.status === "queued"
-          ? "Queued, waiting for a worker to pick it up."
-          : "Running: finding and fetching pages."}
-      </p>
-      {job.status === "running" && (
-        <p className="text-sm text-muted">
-          {job.pages_discovered === 0
-            ? "Discovering pages…"
-            : `Crawled ${job.pages_crawled} of ${job.pages_discovered} pages discovered.`}
-        </p>
-      )}
-      {problem && (
-        <p role="alert" className="text-sm text-danger">
-          {problem}
-        </p>
-      )}
-    </section>
-  );
-}
-
-function Warnings({ warnings }: { warnings: string[] }) {
-  return (
-    <details className="text-sm text-muted">
-      <summary className="cursor-pointer">
-        {warnings.length} {warnings.length === 1 ? "warning" : "warnings"} from the last run
-      </summary>
-      <ul className="mt-2 list-disc space-y-1 pl-5">
-        {warnings.map((warning, i) => (
-          <li key={i}>{warning}</li>
-        ))}
-      </ul>
-    </details>
-  );
-}
-
-function HostedUrl({ siteId }: { siteId: string }) {
-  const url = hostedUrl(siteId);
-  return (
-    <section className="space-y-2">
-      <h2 className="text-lg font-semibold">Hosted URL</h2>
-      <p className="text-sm text-muted">
-        This URL always serves the latest version. Point or redirect your site&apos;s /llms.txt
-        here to keep it up to date.
-      </p>
-      <div className="flex flex-wrap items-center gap-2">
-        <code className="min-w-0 flex-1 rounded-md border border-border bg-surface px-3 py-1.5 font-mono text-sm break-all">
-          {url}
-        </code>
-        <CopyButton text={url} label="Copy URL" />
+    <section className="space-y-3">
+      <h2 className="font-medium">Generating llms.txt</h2>
+      <div
+        role="progressbar"
+        aria-label="Progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(fraction * 100)}
+        // Pulses until the first page count arrives, so a bar at 0 doesn't look stuck.
+        className={`h-1 overflow-hidden rounded-full bg-border ${fraction === 0 ? "animate-pulse" : ""}`}
+      >
+        <div
+          className="h-full rounded-full bg-foreground transition-[width] duration-500 ease-out"
+          style={{ width: `${fraction * 100}%` }}
+        />
       </div>
+      {/* Not a live region: announcing the count every 1.5 s would be noise. The bar's value
+          carries progress for assistive tech. */}
+      <p className="text-sm text-muted tabular-nums">{problem ?? progressLine(job)}</p>
     </section>
   );
 }
