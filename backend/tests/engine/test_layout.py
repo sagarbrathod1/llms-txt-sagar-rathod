@@ -22,7 +22,6 @@ def test_locale_and_version_segments():
     assert all(is_locale(s) for s in ["en", "en-US", "pt_br", "zh-hans", "es-419"])
     assert not any(is_locale(s) for s in ["ai", "go", "tv", "docs", "eng"])
     assert all(is_version(s) for s in ["2.x", "3.0.1", "v2", "2.0.0-alpha.30", "latest", "stable"])
-    assert all(is_version(s) for s in ["2025-04", "2024-06-20"])  # dated API versions
     assert not any(is_version(s) for s in ["docs", "2026", "v", "web3", "2026-blog", "1999-2001"])
 
 
@@ -194,3 +193,29 @@ def test_date_archives_are_dated_but_not_items():
     # ...but it's a listing, not a post: a page linking to many of them isn't a feed.
     assert not layout.is_item(f"{ORIGIN}/2002/")
     assert layout.is_item(f"{ORIGIN}/2026/11/20/a-post/")
+
+
+def test_api_versions_named_by_date_count_only_in_docs():
+    layout = detect()
+    # Pinecone's /reference/api/2025-04/...: each dated folder is a copy of the API reference.
+    assert layout.is_versioned(f"{ORIGIN}/reference/api/2025-04/chat")
+    assert layout.is_versioned(f"{ORIGIN}/docs/api/2024-06-20/charges")
+    assert layout.section_segments(f"{ORIGIN}/reference/api/2025-04/chat") == [
+        "reference", "api", "chat"
+    ]  # fmt: skip
+    # Elsewhere a dated folder is an entry or an issue, not a copy of its index.
+    for path in ["/changelog/2025-04-01", "/newsletter/2025-04", "/events/2025-04/agenda"]:
+        assert not layout.is_versioned(ORIGIN + path), path
+    assert layout.is_dated(f"{ORIGIN}/changelog/2025-04-01")  # still a dated post
+    assert layout.without_version_copies(
+        [f"{ORIGIN}/changelog", f"{ORIGIN}/changelog/2025-04-01"]
+    ) == [f"{ORIGIN}/changelog", f"{ORIGIN}/changelog/2025-04-01"]
+    # Only real months.
+    assert not layout.is_versioned(f"{ORIGIN}/reference/api/2025-13/chat")
+
+
+def test_a_category_page_2_is_a_listing_like_any_other():
+    layout = detect()
+    assert layout.is_category(f"{ORIGIN}/category/news/")
+    assert not layout.is_category(f"{ORIGIN}/category/news/page/2/")
+    assert layout.is_listing(f"{ORIGIN}/category/news/page/2/")

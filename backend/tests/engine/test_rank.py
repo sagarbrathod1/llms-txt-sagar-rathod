@@ -307,6 +307,10 @@ def test_categories_rank_like_listings_but_are_not_capped_with_them():
     listed = [url for _, urls in sections_of([*categories, *tags, "/about"]) for url in urls]
     assert set(categories) <= set(listed)
     assert sum(url in tags for url in listed) == rank_module.MAX_LISTING_PAGES
+    # A category's page 2, 3, ... repeats links like any listing: capped with them.
+    pages = [f"/category/c{n}/page/{p}/" for n in range(3) for p in range(2, 6)]
+    listed = [url for _, urls in sections_of([*pages, "/about"]) for url in urls]
+    assert sum(url in pages for url in listed) == rank_module.MAX_LISTING_PAGES
 
 
 def test_a_lone_docs_page_joins_docs_and_the_docs_landing_heads_its_own_section():
@@ -332,3 +336,13 @@ def test_fetching_skips_turns_for_folders_nothing_links_to():
     assert picked == [*linked]
     # With nothing linked at all (an app's empty homepage), every folder takes turns.
     assert len(set(ranker().pick_to_fetch([*records, *linked], 4)) & set(records)) == 2
+
+
+def test_fetching_the_rest_of_the_site_gives_subfolders_no_turns_of_their_own():
+    """Review repro (gov.uk): in a big sitemap folder, each subfolder's best page is an
+    arbitrary record (a 2014 statistic, a 1979 consultation). Outside the docs, pages are
+    fetched by section turns and rank only."""
+    linked = [f"{ORIGIN}/government/organisations/o{n}" for n in range(3)]
+    records = [f"{ORIGIN}/government/statistics/s{n}" for n in range(3)]
+    r = ranker(inlinks=dict.fromkeys(linked, 1))
+    assert r.pick_to_fetch(r.rank([*records, *linked]), 3) == linked

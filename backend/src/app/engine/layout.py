@@ -26,9 +26,12 @@ ISO_639_1 = set(
 )
 # A language code with an optional region or script: en, en-us, pt_BR, zh-hans, es-419.
 LOCALE = re.compile(r"^([a-z]{2})(?:[-_]([a-z]{2,4}|\d{3}))?$")
-# A version folder: 2.x, 3.0.1, v2, 2.0.0-alpha.30, and API versions named by date, 2025-04 or
-# 2024-06-20 (Pinecone, Stripe), each a whole copy of the API reference.
-VERSION = re.compile(r"^v?\d+(\.[\w-]+)+$|^v\d+$|^(19|20)\d{2}-\d{2}(-\d{2})?$")
+# A version folder: 2.x, 3.0.1, v2, 2.0.0-alpha.30.
+VERSION = re.compile(r"^v?\d+(\.[\w-]+)+$|^v\d+$")
+# API versions named by date, 2025-04 or 2024-06-20 (Pinecone, Stripe): each a whole copy of
+# the API reference. Only in docs (see SiteLayout.without_versions): elsewhere a dated folder
+# is a changelog entry or a newsletter issue, not a copy.
+DATE_VERSION = re.compile(r"^(19|20)\d{2}-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?$")
 # Names docs sites give their moving versions. Each is a whole copy of the docs.
 VERSION_ALIASES = {"latest", "stable", "next", "current", "nightly", "canary", "unreleased"}
 # Build output of docs generators (Sphinx's _modules, _sources, genindex) and search pages:
@@ -211,7 +214,16 @@ class SiteLayout:
 
     def section_segments(self, url: str) -> list[str]:
         """segments() without docs-version folders, which never make good section names."""
-        return [segment for segment in self.segments(url) if not is_version(segment)]
+        return self.without_versions(self.segments(url))
+
+    def without_versions(self, segments: list[str]) -> list[str]:
+        """`segments` without docs-version folders: 2.x, latest, and, in docs (a docs scope or
+        under a folder named like docs), API versions named by date (/reference/api/2025-04/)."""
+        in_docs = self.docs_scope or bool(segments) and segments[0] in DOCS_NAMES
+        return [
+            segment for segment in segments
+            if not (is_version(segment) or in_docs and DATE_VERSION.match(segment))
+        ]  # fmt: skip
 
     def deep_folder(self, url: str) -> str | None:
         """The page's top folder if that folder is grouped one level deeper: the dominant folder,
@@ -258,12 +270,12 @@ class SiteLayout:
         ]  # fmt: skip
 
     def is_versioned(self, url: str) -> bool:
-        return any(is_version(segment) for segment in self.segments(url))
+        segments = self.segments(url)
+        return len(self.without_versions(segments)) < len(segments)
 
     def version_free_key(self, url: str) -> str:
         """The page with docs-version folders removed: /docs/3.0.1/intro and /docs/intro match."""
-        kept = [segment for segment in self.segments(url) if not is_version(segment)]
-        return "/".join(kept) + "?" + urlsplit(url).query
+        return "/".join(self.section_segments(url)) + "?" + urlsplit(url).query
 
     def is_item(self, url: str) -> bool:
         """A post, story or record: a dated URL, or one with an ID in its path
@@ -272,18 +284,22 @@ class SiteLayout:
 
     def is_listing(self, url: str) -> bool:
         """A page that only lists other pages: tags, categories, authors, archives, page 2."""
-        segments = self.segments(url)
-        if any(segment in LISTING_SEGMENTS for segment in segments):
+        if any(segment in LISTING_SEGMENTS for segment in self.segments(url)):
             return True
-        if any(page == "page" and number.isdigit() for page, number in pairwise(segments)):
+        return self.is_paginated(url) or self.is_date_archive(url)
+
+    def is_paginated(self, url: str) -> bool:
+        """Page 2, 3, ... of a listing: /blog/page/2, ?page=3, ?paged=3 (a number only)."""
+        if any(page == "page" and n.isdigit() for page, n in pairwise(self.segments(url))):
             return True
         query = parse_qsl(urlsplit(url).query)
-        if any(key.lower() in PAGE_PARAMS and value.isdigit() for key, value in query):
-            return True
-        return self.is_date_archive(url)
+        return any(key.lower() in PAGE_PARAMS and value.isdigit() for key, value in query)
 
     def is_category(self, url: str) -> bool:
-        return any(segment in CATEGORY_SEGMENTS for segment in self.segments(url))
+        """A category page itself, a blog's or magazine's section: /category/news/, but not
+        its page 2, which only repeats links like any other listing."""
+        segments = self.segments(url)
+        return any(s in CATEGORY_SEGMENTS for s in segments) and not self.is_paginated(url)
 
     def is_date_archive(self, url: str) -> bool:
         """A path ending in a year (and maybe a month and day): /2002/, /blog/2024/05/.

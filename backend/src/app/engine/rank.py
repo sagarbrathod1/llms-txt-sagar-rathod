@@ -197,6 +197,7 @@ class Ranker:
         sections: set[str | None] | None = None,
         caps: Mapping[str, int] | None = None,
         already: Sequence[str] = (),
+        leaders: bool = True,
     ) -> list[str]:
         """Pick so that a budget covers a site's areas before going deep into any one of them.
 
@@ -209,7 +210,7 @@ class Ranker:
         ones (Pydantic's Validation docs, Cursor's CLI) were never reached. Only sections in
         `sections` (default: all) take turns. Old docs versions, listing pages and dated posts
         never do; they can only fill what's left. `already` continues an earlier pick, as in
-        pick().
+        pick(). With leaders=False, step 1 is skipped (see pick_to_fetch).
         """
         eligible = [
             url for url in ranked
@@ -218,11 +219,11 @@ class Ranker:
             and not self.layout.is_listing(url)
             and not self.layout.is_dated(url)
         ]  # fmt: skip
-        leaders = _folder_leaders(eligible, self.layout.section_segments)
+        first = _folder_leaders(eligible, self.layout.section_segments) if leaders else []
         by_section: dict[str | None, list[str]] = {}
         for url in eligible:  # rank order, so each section's queue is too
             by_section.setdefault(self.section_folder(url), []).append(url)
-        turns = [*leaders, *_interleave(list(by_section.values()))]
+        turns = [*first, *_interleave(list(by_section.values()))]
         taken = self.pick(turns, limit, per_section, already, caps)
         return self.pick(ranked, limit, per_section, already=taken, caps=caps)
 
@@ -250,8 +251,16 @@ class Ranker:
         docs = [url for url in ranked if self.layout.is_docs(url)]
         docs_limit = min(limit, MAX_DOCS_PAGES)
         taken = self.pick_spread(docs, docs_limit, per_section=limit, sections=sections, caps=caps)
+        # Folder leaders only for the docs: in the rest of a big sitemap, every subfolder's best
+        # page is an arbitrary record (gov.uk's 2014 NHS Wales statistic, a 1979 consultation).
         return self.pick_spread(
-            ranked, limit, per_section=limit, sections=sections, caps=caps, already=taken
+            ranked,
+            limit,
+            per_section=limit,
+            sections=sections,
+            caps=caps,
+            already=taken,
+            leaders=False,
         )
 
     def kinds(self, url: str) -> set[str]:
