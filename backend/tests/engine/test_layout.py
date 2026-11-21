@@ -7,7 +7,7 @@ ORIGIN = "https://example.com"
 def home(path="/", alternates=()):
     return Page(
         url=ORIGIN + path, canonical=None, title=None, description=None, paragraphs=[],
-        site_name=None, alt_site_names=[], lang=None,
+        is_hub=False, site_name=None, alt_site_names=[], lang=None,
         noindex=False, links=[], alternates=[ORIGIN + a for a in alternates],
     )  # fmt: skip
 

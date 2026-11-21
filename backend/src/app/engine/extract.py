@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from app.engine.parse_thread import run_in_parse_thread
 from app.engine.urls import normalize_page_url
@@ -45,6 +45,15 @@ CHROME_TAGS = {"aside", "footer", "form", "header", "nav", "noscript"}
 CHROME_HINTS = re.compile(
     r"banner|consent|cookie|modal|newsletter|no-?js|popup|subscribe", re.IGNORECASE
 )
+HEADINGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
+# Text that is nearly all link text is a list of links, not something that describes a page.
+# A page like that is a hub: a section front, an archive, a list of essays, whose paragraphs
+# introduce today's items, so they can't describe it (and would change daily). A paragraph like
+# that is a tag cloud. Measured on real pages: hubs 0.80-0.99 (BBC and Spiegel section fronts,
+# gov.uk's organisation list, htmx's essays); docs pages whose sidebar sits inside <main>
+# 0.52-0.77 (svelte.dev's tutorial, hono.dev/examples); articles 0.02-0.45; tag clouds 0.9+;
+# prose with inline links up to ~0.6 (jvns.ca's TILs).
+LINK_LIST_SHARE = 0.8
 
 
 @dataclass
@@ -54,8 +63,11 @@ class Page:
     title: str | None
     description: str | None  # from meta tags: description, og:description, twitter:description
     # The first few substantial paragraphs of the content: fallback descriptions, also used
-    # when the meta description turns out to be one the whole site shares.
+    # when the meta description turns out to be one the whole site shares. Teasers for other
+    # pages (a card's text under a link to the story) are left out: they aren't this page's.
     paragraphs: list[str]
+    # Nearly all of the content's text is link text: a hub or listing page (see LINK_LIST_SHARE).
+    is_hub: bool
     site_name: str | None  # og:site_name; only used from the homepage
     # Other names the homepage gives the site: application-name, then JSON-LD WebSite or
     # Organization name. Used for the H1 when there's no og:site_name.
@@ -98,6 +110,7 @@ def extract_page(
     if soup.contains_replacement_characters:
         logger.debug("%s: some characters couldn't be decoded", url)
     meta = _meta_tags(soup)
+    content = _content_root(soup)
 
     title = _title_tag_text(soup) or meta.get("og:title")
     if not title and (h1 := soup.find("h1")):
@@ -133,7 +146,8 @@ def extract_page(
         canonical=canonical,
         title=title,
         description=_truncate(description),
-        paragraphs=[_truncate(text) or text for text in _first_paragraphs(soup)],
+        paragraphs=[_truncate(text) or text for text in _first_paragraphs(content, url, origin)],
+        is_hub=_link_text_share(content) > LINK_LIST_SHARE,
         site_name=meta.get("og:site_name"),
         alt_site_names=[
             name for name in [meta.get("application-name"), *_jsonld_names(soup)] if name
@@ -180,22 +194,76 @@ def _links_with_rel(soup: BeautifulSoup, rel: str) -> list[Tag]:
     ]
 
 
-def _first_paragraphs(soup: BeautifulSoup) -> list[str]:
-    """The first few substantial paragraphs of the page's content, skipping site chrome.
+def _content_root(soup: BeautifulSoup) -> Tag:
+    """The page's content: <main> or <article> when the page marks it, else the whole body."""
+    return soup.find("main") or soup.find("article") or soup.body or soup
 
-    Looks in <main> or <article> when the page marks its content, else the whole body.
-    """
-    root = soup.find("main") or soup.find("article") or soup.body or soup
+
+def _first_paragraphs(root: Tag, url: str, origin: str) -> list[str]:
+    """The first few substantial paragraphs of the page's own content, skipping site chrome,
+    teasers for other pages, and paragraphs that are nearly all links (a tag cloud)."""
     found: list[str] = []
     for paragraph in root.find_all("p"):
         if len(found) == MAX_PARAGRAPHS:
             break
-        if _inside_chrome(paragraph, root):
+        if (
+            _inside_chrome(paragraph, root)
+            or _is_teaser(paragraph, root, url, origin)
+            or _link_text_share(paragraph) > LINK_LIST_SHARE
+        ):
             continue
         text = clean_text(paragraph.get_text(" "))
         if text and len(text) >= MIN_PARAGRAPH_CHARS and _reads_as_description(text):
             found.append(text)
     return found
+
+
+def _is_teaser(paragraph: Tag, root: Tag, url: str, origin: str) -> bool:
+    """Whether the paragraph introduces another page, as in a card on a section front.
+
+    Either a link to another page wraps it (BBC wraps whole cards), or the nearest heading
+    around it links to another page ("<h2><a href=/post>Title</a></h2><p>First lines...</p>"
+    on a blog's front page). Headings linking to themselves (permalinks, "¶") don't count.
+    """
+    for parent in paragraph.parents:
+        if parent is root:
+            return False
+        if parent.name == "a":
+            return _links_elsewhere([parent], url, origin)
+        if heading := parent.find(HEADINGS):
+            anchors = heading.find_all("a", href=True)
+            if wrapper := heading.find_parent("a", href=True):
+                anchors.append(wrapper)
+            return _links_elsewhere(anchors, url, origin)
+    return False
+
+
+def _links_elsewhere(anchors: list[Tag], url: str, origin: str) -> bool:
+    """Whether any of the links leads to another page of the site."""
+    for anchor in anchors:
+        target = normalize_page_url(anchor.get("href") or "", url, origin)
+        if target and target.rstrip("/") != url.rstrip("/"):
+            return True
+    return False
+
+
+def _link_text_share(root: Tag) -> float:
+    """The share of the content's text (outside site chrome) that sits inside links."""
+    total = linked = 0
+    # A stack, not recursion: hostile HTML can nest deeper than Python's recursion limit.
+    stack = [(root, False)]
+    while stack:
+        node, in_link = stack.pop()
+        for child in node.children:
+            if isinstance(child, Tag):
+                if not _is_chrome(child):
+                    stack.append((child, in_link or child.name == "a"))
+            # Exactly NavigableString: its subclasses are comments, scripts and styles.
+            elif type(child) is NavigableString:
+                length = len(child.strip())
+                total += length
+                linked += length if in_link else 0
+    return linked / total if total else 0.0
 
 
 def _reads_as_description(text: str) -> bool:

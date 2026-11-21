@@ -158,3 +158,38 @@ def test_alternative_site_names_from_application_name_and_jsonld():
         '<script type="application/ld+json">{broken</script>'
     )
     assert extract(page(head=head)).alt_site_names == ["Acme App", "Acme", "Acme Inc"]
+
+
+def test_teasers_for_other_pages_are_not_the_pages_own_paragraphs():
+    """Regression (BBC, simonwillison.net): a section front's description was the teaser of
+    today's top story, so it changed every day."""
+    teaser = "Today's top story is about something that happened this very morning."
+    own = "This section covers the business news that matters to you, every day."
+    wrapped_card = f'<a href="/story-1"><h3>Story</h3><p>{teaser}</p></a>'
+    heading_card = f'<div><h2><a href="/2026/11/story-2">Story</a></h2><p>{teaser}</p></div>'
+    assert extract(page(body=f"<main>{wrapped_card}</main>")).paragraphs == []
+    assert extract(page(body=f"<main>{heading_card}</main>")).paragraphs == []
+    # A heading that links to the page itself (a permalink, a "¶" anchor) isn't a card.
+    permalink = f'<div><h1>Docs <a href="#docs">¶</a> <a href="/docs/">#</a></h1><p>{own}</p></div>'
+    assert extract(page(body=f"<main>{permalink}</main>")).paragraphs == [own]
+
+
+def test_nearly_all_link_text_marks_a_hub_and_skips_tag_clouds():
+    intro = "<p>This section covers the business news that matters to you, every day.</p>"
+    headlines = "".join(
+        f'<li><a href="/story-{n}">A headline about story number {n}</a></li>' for n in range(9)
+    )
+    hub = extract(page(body=f"<main>{intro}<ul>{headlines}</ul></main>"))
+    assert hub.is_hub  # so its paragraphs never become its description
+    article = extract(page(body=f'<main>{intro * 3}<a href="/related">Related</a></main>'))
+    assert not article.is_hub
+    # simonwillison.net's homepage summary was its tag cloud.
+    tags = ["python", "webassembly", "llm-release", "security", "browsers"] * 4
+    cloud = " ".join(f'<a href="/tags/{tag}/">{tag}</a> {n}' for n, tag in enumerate(tags))
+    assert extract(page(body=f"<main><p>On {cloud}.</p></main>")).paragraphs == []
+    # Prose with inline links is still prose (jvns.ca: 0.6 link text).
+    prose = (
+        'I just learned that <a href="/a">strace has a --stack-traces option</a> from '
+        '<a href="/b">this nice blog post</a> today.'
+    )
+    assert extract(page(body=f"<main><p>{prose}</p></main>")).paragraphs
