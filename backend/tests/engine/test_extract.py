@@ -220,10 +220,39 @@ def test_a_linked_heading_after_the_intro_does_not_make_it_a_teaser(body):
     assert extract(page(body=f"<main>{body}</main>")).paragraphs[:1] == [INTRO]
 
 
-def test_a_card_with_its_headline_below_the_blurb_is_a_teaser():
-    # The Verge's cards put the linked headline under the text.
-    card = f'<div><div><p>{INTRO}</p></div><h2><a href="/story">Story</a></h2></div>'
-    assert extract(page(body=f"<main>{card}{card}</main>")).paragraphs == []
+@pytest.mark.parametrize(
+    "after",
+    [
+        '<h2><a href="/next">Read next</a></h2>',
+        '<div class="hero"><h3><a href="/signup">Sign up</a></h3></div>',
+        '<h2><a href="/docs/configure">Next: Configure</a></h2>',
+    ],
+)
+def test_a_single_paragraph_followed_by_a_linked_heading_is_kept(after):
+    assert extract(page(body=f"<main><div><p>{INTRO}</p>{after}</div></main>")).paragraphs == [
+        INTRO
+    ]
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        '<h1><a href="/">Simon Willison’s Weblog</a></h1>',  # the site title links home
+        '<header><h2><a href="/blog/">The blog</a></h2></header>',  # a heading in site chrome
+        '<h2>By <a href="/authors/jo">Jo Example</a>, our editor at large</h2>',  # a byline
+    ],
+)
+def test_headings_that_dont_introduce_another_page_are_not_teaser_headings(heading):
+    """Regression (simonwillison.net link posts): the site's <h1><a href="/"> title made the
+    article's own paragraphs look like teasers."""
+    assert extract(page(body=f"<div>{heading}<p>{INTRO}</p></div>")).paragraphs == [INTRO]
+
+
+def test_a_heading_linking_to_another_site_makes_a_teaser():
+    """Regression (martinfowler.com tag pages): described by the first item's off-site
+    abstract, because a link to another origin didn't count as "elsewhere"."""
+    item = f'<h2><a href="https://other.example/article">Article</a></h2><p>{INTRO}</p>'
+    assert extract(page(body=f"<main>{item}</main>")).paragraphs == []
 
 
 def test_a_page_of_thousands_of_paragraphs_parses_quickly():

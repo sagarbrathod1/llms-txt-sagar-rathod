@@ -137,7 +137,9 @@ def page_title(
             # name comes off; if nothing else is left, the URL names the page (an app shell).
             # semver.org/spec carries "Semantic Versioning 2.0.0 | Semantic Versioning" too.
             rest = _strip_symbol_words(_strip_ends(title, {_comparable(site_name)}))
-            if rest and _comparable(rest) not in says_nothing:
+            # ...unless that is boilerplate too: content pages that all reuse the homepage's
+            # "Acme | Widgets for everyone" mustn't become "Widgets for everyone (About)".
+            if rest and _comparable(rest) not in says_nothing | shared_parts:
                 return rest
             return title_from_path(url)
         title = _strip_symbol_words(_strip_ends(title, says_nothing | shared_parts))

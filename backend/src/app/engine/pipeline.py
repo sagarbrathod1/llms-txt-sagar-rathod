@@ -286,9 +286,13 @@ def _own_paragraphs(page: Page, layout: SiteLayout) -> list[str]:
 def _is_feed(page: Page, layout: SiteLayout) -> bool:
     """A page listing many dated or numbered items: a blog's front page, a news section.
 
-    Measured: feeds link to 37-599 such items (The Verge's sections, simonwillison.net,
-    jvns.ca, BBC Arts); articles to 3-16 (related stories); docs pages to 0-1.
+    Measured: such listings link to 37-599 items (The Verge's sections, simonwillison.net,
+    jvns.ca, BBC Arts); docs pages to 0-1. A page that is itself an item is never a feed,
+    however many items its sidebar lists: ordinary articles link to anywhere from 3 to
+    hundreds (krebsonsecurity.com 27, a kubernetes.io blog post 777, Google Help 108).
     """
+    if layout.is_item(page.url):
+        return False
     return sum(layout.is_item(link) for link in page.links) >= FEED_MIN_ITEMS
 
 

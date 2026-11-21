@@ -208,6 +208,10 @@ def test_a_page_titled_exactly_like_the_homepage_falls_back_even_without_the_sit
     shared = {"acme", "the app for widgets"}  # every shell page carries both parts
     url = f"{ORIGIN}/dashboard"
     assert page_title(shell, "Acme Inc", url, shared, home_title=shell) == "Dashboard"
+    # Content pages that all reuse the homepage's title: what's left is boilerplate too.
+    reused = "Acme | Widgets for everyone"
+    url = f"{ORIGIN}/about"
+    assert page_title(reused, "Acme", url, {"widgets for everyone"}, home_title=reused) == "About"
     # ...but what's left after the site name still names the page (semver.org/spec).
     spec = "Semantic Versioning 2.0.0 | Semantic Versioning"
     url = f"{ORIGIN}/spec/v2.0.0.html"

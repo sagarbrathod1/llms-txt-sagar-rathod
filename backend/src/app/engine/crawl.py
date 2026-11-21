@@ -24,8 +24,11 @@ BFS_MAX_DEPTH = 3
 # More failures than this, and more than half of the pages tried, mean the site is down or
 # blocking us; a file built from the few that worked would misrepresent the site.
 MIN_FAILURES_TO_GIVE_UP = 3
-# Statuses that mean "not for you": the site refused this client. 406 is what Le Monde's bot
-# protection answers for most pages; our requests accept HTML, so it isn't a negotiation issue.
+# Statuses that mean "not for you": the site refused this client. 406 ("Not Acceptable") is
+# what Le Monde's bot protection answered for most pages. In principle it can mean the server
+# has no format our Accept header lists (HTML and XHTML, no */*), but a site that has no HTML
+# for an HTML link is refusing us in practice, and counting it as a failure only means a
+# recheck won't replace a good version.
 REFUSAL_STATUSES = (401, 403, 406)
 # Titles of the pages bot-protection services serve in place of the real page, often with
 # HTTP 200 (Le Monde's "Client Challenge"). Matched against the title's first part without
@@ -284,8 +287,8 @@ class Crawl:
         if self.shell_title() is not None:
             out.append(
                 "Most pages came back as the same nearly empty page: the site may build its "
-                "pages with JavaScript, which this tool doesn't run. Their titles were taken "
-                "from their URLs."
+                "pages with JavaScript, which this tool doesn't run, or these pages may not "
+                "exist. Their titles were taken from their URLs."
             )
         if self.out_of_time:
             out.append(

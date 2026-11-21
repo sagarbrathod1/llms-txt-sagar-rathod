@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
@@ -41,8 +42,6 @@ MAX_PARAGRAPHS = 3
 # Paragraphs examined per page before giving up: the description is near the top, and a
 # page of thousands of tiny paragraphs mustn't cost thousands of structural checks.
 MAX_PARAGRAPHS_EXAMINED = 50
-# How far up from a paragraph a card (one heading, one paragraph) is looked for.
-CARD_DEPTH = 4
 # Paragraphs inside these are site chrome, not the page's content.
 CHROME_TAGS = {"aside", "footer", "form", "header", "nav", "noscript"}
 # class/id hints of banners, pop-ups and "JavaScript didn't run" notices (python.org's
@@ -218,7 +217,9 @@ def _first_paragraphs(root: Tag, url: str, origin: str) -> list[str]:
         if not isinstance(element, Tag):
             continue
         if element.name in HEADINGS:
-            heading = element
+            # A heading in site chrome (a header's site title) doesn't introduce what follows.
+            if not _inside_chrome(element, root):
+                heading = element
             continue
         if element.name != "p":
             continue
@@ -243,26 +244,19 @@ def _is_teaser(paragraph: Tag, heading: Tag | None, root: Tag, url: str, origin:
     """Whether the paragraph introduces another page, as in a card on a section front.
 
     - A link to another page wraps it (BBC wraps whole cards).
-    - The heading before it links to another page ("<h2><a href=/post>Title</a></h2>
-      <p>First lines...</p>" on a blog's front page). Headings linking to themselves
-      (permalinks, "¶") don't count, and neither do headings after it ("Read next").
-    - It's the one paragraph of a small card whose one heading, before or after it, links
-      to another page (The Verge puts the headline below the blurb).
+    - The heading before it is a link to another page ("<h2><a href=/post>Title</a></h2>
+      <p>First lines...</p>" on a blog's front page, or an off-site article on a tag page).
+      Headings after it don't count ("Read next"), nor do headings that are mostly plain
+      text ("By <a>Jo</a>"), link to the page itself (permalinks, "¶") or to the homepage
+      (a site title in <h1><a href="/">).
     """
-    for depth, parent in enumerate(paragraph.parents):
+    for parent in paragraph.parents:
         if parent is root:
             break
         if parent.name == "a":
             return _links_elsewhere([parent], url, origin)
-        if depth < CARD_DEPTH and (headings := parent.find_all(HEADINGS, limit=2)):
-            card = len(headings) == 1 and len(parent.find_all("p", limit=2)) == 1
-            if card and _heading_links_elsewhere(headings[0], url, origin):
-                return True
-            break  # the nearest container with a heading decides; larger ones aren't cards
-    return heading is not None and _heading_links_elsewhere(heading, url, origin)
-
-
-def _heading_links_elsewhere(heading: Tag, url: str, origin: str) -> bool:
+    if heading is None or _link_text_share(heading) <= LINK_LIST_SHARE:
+        return False
     anchors = heading.find_all("a", href=True)
     if wrapper := heading.find_parent("a", href=True):
         anchors.append(wrapper)
@@ -270,10 +264,20 @@ def _heading_links_elsewhere(heading: Tag, url: str, origin: str) -> bool:
 
 
 def _links_elsewhere(anchors: list[Tag], url: str, origin: str) -> bool:
-    """Whether any of the links leads to another page of the site."""
+    """Whether any of the links leads to another page: of this site, other than this page and
+    the homepage, or of another site."""
+    home = origin + "/"
     for anchor in anchors:
-        target = normalize_page_url(anchor.get("href") or "", url, origin)
-        if target and target.rstrip("/") != url.rstrip("/"):
+        href = anchor.get("href") or ""
+        target = normalize_page_url(href, url, origin)
+        if target is None:
+            try:  # another site (http/https); mailto:, javascript: and files don't count
+                if urlsplit(urljoin(url, href)).scheme in ("http", "https"):
+                    return True
+            except ValueError:  # malformed hosts ("http://[bad")
+                pass
+            continue
+        if target.rstrip("/") not in (url.rstrip("/"), home.rstrip("/")):
             return True
     return False
 

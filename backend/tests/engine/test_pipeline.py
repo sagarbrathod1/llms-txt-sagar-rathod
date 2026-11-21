@@ -709,7 +709,7 @@ def test_identical_empty_pages_warn_and_are_titled_from_their_urls(home_title, s
     routes |= {f"{ORIGIN}{path}": page(shell_title) for path in NAV}
     result = run(FakeSite(routes))
     assert sorted(p.title for p in result.pages) == ["Api", "Pricing", "Privacy", "Start"]
-    assert any("the same nearly empty page" in w for w in result.warnings)
+    assert any("the same nearly empty page" in w and "may not exist" in w for w in result.warnings)
 
 
 def test_feed_pages_are_described_by_their_meta_description_or_not_at_all():
@@ -724,6 +724,20 @@ def test_feed_pages_are_described_by_their_meta_description_or_not_at_all():
     text = run(FakeSite(routes)).llms_txt
     assert "- [Energy](https://example.com/energy)\n" in text
     assert "latest story" not in text
+
+
+def test_an_article_with_a_long_sidebar_of_stories_is_not_a_feed():
+    """Regression (krebsonsecurity.com, kubernetes.io's blog, Google Help): articles whose
+    sidebars list dozens of dated posts lost their own descriptions."""
+    sidebar = "".join(f'<a href="/2026/11/{n:02}/post">Post {n}</a>' for n in range(1, 31))
+    own = "<p>This article explains how the breach happened and what to do about it.</p>"
+    article = "/2026/11/19/the-breach"
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(links=[*NAV, article]),
+        f"{ORIGIN}{article}": page("The breach | Acme", body=f"<main>{own}{sidebar}</main>"),
+    }
+    text = run(FakeSite(routes)).llms_txt
+    assert "the-breach): This article explains how the breach happened" in text
 
 
 def test_hub_pages_are_described_by_their_meta_description_or_not_at_all():
