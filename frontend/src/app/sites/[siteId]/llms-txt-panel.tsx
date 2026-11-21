@@ -1,10 +1,10 @@
 "use client";
 
-import { Fragment, useState } from "react";
+import { Fragment, useRef, useState } from "react";
 
 import { CopyButton } from "@/components/copy-button";
 import { errorText, getVersion, hostedUrl, type Site, type Version } from "@/lib/api";
-import { formatDate, formatDay } from "@/lib/format";
+import { formatDate } from "@/lib/format";
 
 type Props = { site: Site; latest: Version };
 
@@ -17,25 +17,33 @@ export function LlmsTxtPanel({ site, latest }: Props) {
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // The version last asked for. "Back to current" doesn't wait for an older version that is still
+  // loading, so a response is applied only if it is still the one wanted.
+  const requested = useRef(latest.id);
+
   async function showVersion(versionId: string) {
+    requested.current = versionId;
     setError(null);
     if (versionId === latest.id) {
       setShown(latest);
+      setLoadingId(null);
       return;
     }
     setLoadingId(versionId);
     try {
-      setShown(await getVersion(site.id, versionId));
+      const version = await getVersion(site.id, versionId);
+      if (requested.current === versionId) setShown(version);
     } catch (err) {
-      setError(`Couldn't load that version. ${errorText(err)}`);
+      if (requested.current === versionId) setError(`Couldn't load that version. ${errorText(err)}`);
     } finally {
-      setLoadingId(null);
+      if (requested.current === versionId) setLoadingId(null);
     }
   }
 
   const isLatest = shown.id === latest.id;
-  // Warnings belong to the run that made the shown file, so they're shown only for the latest
-  // file, and only once that run has finished (a running check has none yet).
+  // Warnings come from the latest run, which may not have changed the file. They're shown with
+  // the current file only (an older version's run is long gone), and only once that run has
+  // finished (a running check has none yet).
   const job = site.latest_job;
   const warnings = isLatest && job?.status === "succeeded" ? job.warnings : [];
 
@@ -83,12 +91,11 @@ export function LlmsTxtPanel({ site, latest }: Props) {
         {warnings.length > 0 && <Notes warnings={warnings} />}
       </section>
 
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium">History</h2>
-        {site.versions.length <= 1 ? (
-          // A version is saved only when the file changes, so one version means no changes yet.
-          <p className="text-sm text-muted">No changes since {formatDay(latest.created_at)}.</p>
-        ) : (
+      {/* A version is saved only when the file changes, so with one version there is no history
+          to show; the status line already says when it was generated. */}
+      {site.versions.length > 1 && (
+        <section className="space-y-3">
+          <h2 className="text-sm font-medium">History</h2>
           <ul className="text-sm">
             {site.versions.map((version) => (
               <li key={version.id}>
@@ -112,13 +119,13 @@ export function LlmsTxtPanel({ site, latest }: Props) {
               </li>
             ))}
           </ul>
-        )}
-        {error && (
-          <p role="alert" className="text-sm text-danger">
-            {error}
-          </p>
-        )}
-      </section>
+          {error && (
+            <p role="alert" className="text-sm text-danger">
+              {error}
+            </p>
+          )}
+        </section>
+      )}
     </div>
   );
 }
