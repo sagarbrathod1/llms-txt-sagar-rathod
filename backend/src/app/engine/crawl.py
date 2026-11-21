@@ -24,9 +24,14 @@ BFS_MAX_DEPTH = 3
 # More failures than this, and more than half of the pages tried, mean the site is down or
 # blocking us; a file built from the few that worked would misrepresent the site.
 MIN_FAILURES_TO_GIVE_UP = 3
+# Statuses that mean "not for you": the site refused this client. 406 is what Le Monde's bot
+# protection answers for most pages; our requests accept HTML, so it isn't a negotiation issue.
+REFUSAL_STATUSES = (401, 403, 406)
 # Titles of the pages bot-protection services serve in place of the real page, often with
 # HTTP 200 (Le Monde's "Client Challenge"). Matched against the title's first part without
 # trailing punctuation, so "Just a moment..." and "Attention Required! | Cloudflare" match.
+# Only together with no links into the site: real pages can carry these words too
+# (ddos-guard.net's homepage is "DDoS-Guard | Reliable DDoS Protection").
 # Detected so we can stop and say so: we never try to get past them.
 BOT_CHECK_TITLES = {
     "access denied", "are you a robot", "attention required", "client challenge",
@@ -35,18 +40,21 @@ BOT_CHECK_TITLES = {
 }  # fmt: skip
 
 
-def is_bot_check(title: str | None) -> bool:
-    if not title:
+def is_bot_check(page: Page) -> bool:
+    """A challenge page: a known challenge title, and no links into the site (a real page
+    links to the rest of its site; Le Monde's "Client Challenge" page has none)."""
+    if not page.title or page.links:
         return False
-    first_part = TITLE_SEPARATOR.split(title)[0]
+    first_part = TITLE_SEPARATOR.split(page.title)[0]
     return first_part.lower().rstrip(" .…!?") in BOT_CHECK_TITLES
 
 
 def is_empty_shell(page: Page) -> bool:
     """No links into the site and no paragraph of text: nothing an llms.txt could describe.
 
-    What a JavaScript app serves for every route before its scripts run, and what bot checks
-    look like. Real pages, however short, link to the rest of their site.
+    What a JavaScript app serves for every route before its scripts run (and what a stale
+    sitemap's "Page not found" pages served with HTTP 200 look like). Real pages, however
+    short, link to the rest of their site.
     """
     return not page.links and not page.paragraphs
 
@@ -97,7 +105,7 @@ class Crawl:
         # Planned but never sent: the run deadline came first. Counted as attempted and failed
         # (see GenerationResult), so a truncated recheck can't replace a complete version.
         self.unsent: set[str] = set()
-        # 401/403: the site refused us. Also in `failed`: a recheck that was blocked must not
+        # 401/403/406: the site refused us. Also in `failed`: a recheck that was blocked mustn't
         # replace a good version. Tracked separately for the "blocking our crawler" error.
         self.refused: set[str] = set()
         # Pages answered with a bot check instead of the content (URL -> its title). Also in
@@ -186,9 +194,10 @@ class Crawl:
             return None
         except FetchError as error:
             # Transient, rate-limited or refused: the page exists but we couldn't get it now.
-            failed = error.retryable or error.status in (401, 403, 429)
+            refused = error.status in REFUSAL_STATUSES
+            failed = error.retryable or refused or error.status == 429
             (self.failed if failed else self.skipped)[url] = str(error)
-            if error.status in (401, 403):
+            if refused:
                 self.refused.add(url)
             self._count_crawled()
             return None
@@ -210,7 +219,7 @@ class Crawl:
             logger.warning("couldn't parse %s", url, exc_info=True)
             self.skipped[url] = "couldn't be parsed"
             return None
-        if is_bot_check(page.title):
+        if is_bot_check(page):
             self.bot_checks[url] = page.title or ""
             self.failed[url] = f"answered with a bot check, {page.title!r}"
             self.refused.add(url)
@@ -228,15 +237,13 @@ class Crawl:
             # Ties broken by the title itself: pages finish in any order, messages shouldn't.
             title = min(counts, key=lambda title: (-counts[title], title))
             raise bot_check_error(f"{len(self.bot_checks)} of the {tried} pages we tried", title)
-        shell_title = self.shell_title()
-        if shell_title and shell_title != self.home.title:
-            # Identical empty pages under a title the homepage doesn't have: a bot check from
-            # a service whose title we don't know. (Under the homepage's title: an app shell.)
-            raise bot_check_error(f"most of the {len(self.pages)} pages we fetched", shell_title)
         if self._is_most_of(len(self.refused), tried):
+            how = "were refused (HTTP 401, 403 or 406)"
+            if self.bot_checks:
+                how += f" or answered with a bot check ({len(self.bot_checks)})"
             raise GenerationError(
                 f"This site is blocking our crawler: {len(self.refused)} of the {tried} pages "
-                "we tried answered HTTP 401 or 403, or with a bot check."
+                f"we tried {how}."
             )
         if self._is_most_of(len(self.failed), tried):
             raise GenerationError(
@@ -252,8 +259,10 @@ class Crawl:
     def shell_title(self) -> str | None:
         """When most fetched pages are the same empty shell, its title ("" if untitled).
 
-        A site whose pages can't be told apart can't be described page by page: it's either a
-        JavaScript app (every route serves the homepage's shell) or a bot check.
+        Such pages can't be told apart by their content, so they're named by their URLs. Most
+        often it's a JavaScript app's shell (with or without a prerendered homepage); it can
+        also be a stale sitemap of "Page not found" pages. Neither is evidence of a bot check,
+        so this only warns: a bot check needs a known challenge title (is_bot_check).
         """
         titles = Counter(page.title or "" for page in self.pages.values() if is_empty_shell(page))
         if not titles:
@@ -272,11 +281,10 @@ class Crawl:
     def warnings(self) -> list[str]:
         """Aggregated, so a big site gives a few readable lines rather than hundreds."""
         out = []
-        # Only an app shell gets this far: raise_if_unusable stops on a bot check's shell.
         if self.shell_title() is not None:
             out.append(
-                "Most pages came back as the same empty page as the homepage: the site builds "
-                "its pages with JavaScript, which this tool doesn't run. Their titles were taken "
+                "Most pages came back as the same nearly empty page: the site may build its "
+                "pages with JavaScript, which this tool doesn't run. Their titles were taken "
                 "from their URLs."
             )
         if self.out_of_time:
@@ -304,7 +312,15 @@ class Crawl:
             out.append(
                 f"{len(noindex)} page(s) are marked noindex and were left out, e.g. {noindex[0]}."
             )
-        for problems, what in ((self.failed, "couldn't be fetched, even after a retry"),
+        if self.bot_checks:
+            url = min(self.bot_checks)
+            out.append(
+                f"{len(self.bot_checks)} page(s) answered with a bot check instead of the page "
+                f"and were left out, e.g. {url} ({self.bot_checks[url]!r})."
+            )
+        # Timeouts and server errors were retried once before landing here; refusals weren't.
+        fetch_failures = {u: r for u, r in self.failed.items() if u not in self.bot_checks}
+        for problems, what in ((fetch_failures, "couldn't be fetched"),
                                (self.skipped, "were skipped")):  # fmt: skip
             if problems:
                 url = min(problems)

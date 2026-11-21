@@ -10,7 +10,14 @@ from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
-from app.engine.crawl import Crawl, bot_check_error, fetch_budget, is_bot_check
+from app.engine.crawl import (
+    REFUSAL_STATUSES,
+    Crawl,
+    bot_check_error,
+    fetch_budget,
+    is_bot_check,
+    is_empty_shell,
+)
 from app.engine.discover import collect_sitemap_urls, fetch_robots
 from app.engine.extract import Page, parse_page
 from app.engine.fetch import (
@@ -21,7 +28,7 @@ from app.engine.fetch import (
     FetchError,
     FetchResult,
 )
-from app.engine.layout import SiteLayout
+from app.engine.layout import SiteLayout, is_locale, is_version, path_segments
 from app.engine.models import GenerationError, GenerationResult, PageInfo, Progress
 from app.engine.rank import unique_pages
 from app.engine.render import render_llms_txt
@@ -32,6 +39,7 @@ from app.engine.titles import (
     choose_site_name,
     page_title,
     shared_title_parts,
+    title_from_path,
 )
 from app.engine.urls import normalize_page_url, origin_of
 
@@ -42,6 +50,8 @@ RUN_DEADLINE_SECONDS = 150
 # A sitemap with fewer URLs than this is probably partial (e.g. only blog posts), so we
 # follow links from the homepage instead.
 MIN_SITEMAP_URLS = 10
+# A page linking to at least this many dated or numbered items is a feed (see _is_feed).
+FEED_MIN_ITEMS = 25
 
 
 @dataclass
@@ -82,7 +92,9 @@ async def run(
         fetcher, site.origin, site.robots, site.home, layout, on_progress, fetch_budget(fetcher)
     )
     crawl.discover(sitemap_urls)
-    if len(set(sitemap_urls)) >= MIN_SITEMAP_URLS:
+    # Only URLs the crawl may fetch count: a scoped crawl (pydantic.dev/docs/) can't use the
+    # root sitemap's marketing pages, and other docs versions are copies.
+    if len({url for url in sitemap_urls if not layout.is_excluded(url)}) >= MIN_SITEMAP_URLS:
         # Homepage links too: the site's navigation is often missing from its sitemaps.
         await crawl.fetch_best(site.home.links + sitemap_urls)
     else:
@@ -96,7 +108,7 @@ async def run(
 
     sections = crawl.ranker().build_sections(describe_pages(site, crawl))
     sections = add_path_hints(sections, layout.segments)
-    summary = site.home.description or next(iter(_own_paragraphs(site.home)), None)
+    summary = site.home.description or next(iter(_own_paragraphs(site.home, layout)), None)
     if summary and _loose(summary) == _loose(site.name):
         summary = None  # "> Acme" under "# Acme" says nothing
     llms_txt = render_llms_txt(site.name, summary, sections, site.origin + site.base)
@@ -131,21 +143,22 @@ async def resolve_site(fetcher: Fetcher, origin: str) -> Site:
     final_origin = origin_of(home_result.url)
     if final_origin is None:
         raise GenerationError(f"{origin} redirects to an address we can't crawl.")
-    home_url = normalize_page_url(home_result.url, home_result.url, final_origin)
-    home_url = home_url or final_origin + "/"
-    base = "/"
+    requested = origin
     if final_origin != origin:
-        if _host(final_origin) != _host(origin):
-            base = _folder(home_url)
-        moved_to = final_origin + base.rstrip("/")
-        part = "that part of the site" if base != "/" else "that site"
-        warnings.append(f"{origin} redirects to {moved_to}, so {part} was crawled.")
         origin = final_origin
         robots = await load_robots(fetcher, origin)
 
+    home_url = normalize_page_url(home_result.url, home_result.url, origin) or origin + "/"
     home = await parse_page(home_result.body, home_url, origin, home_result.charset)
-    if is_bot_check(home.title):
+    if is_bot_check(home):
         raise bot_check_error("its homepage", home.title or "")
+    base = "/"
+    if origin != requested:
+        if _host(origin) != _host(requested):
+            base = _section_folder(home)
+        moved_to = origin + base.rstrip("/")
+        part = "that part of the site" if base != "/" else "that site"
+        warnings.append(f"{requested} redirects to {moved_to}, so {part} was crawled.")
     hostname = urlsplit(origin).hostname or ""
     name = choose_site_name(home.site_name, home.alt_site_names, home.title, hostname)
     return Site(origin=origin, base=base, robots=robots, home=home, name=name, warnings=warnings)
@@ -156,10 +169,24 @@ def _host(origin: str) -> str:
     return (urlsplit(origin).hostname or "").removeprefix("www.")
 
 
-def _folder(url: str) -> str:
-    """The folder a URL is in: "/docs/" for /docs/ and /docs/intro, "/" for /welcome."""
-    path = urlsplit(url).path
-    return path[: path.rfind("/") + 1] or "/"
+def _section_folder(home: Page) -> str:
+    """The top folder another site's redirect landed in, if the site we asked about lives there.
+
+    /docs, /docs/ and /docs/getting-started/overview all give "/docs/" (locale and version
+    folders in front are kept: "/en/docs/"), but only if the landing page links to other
+    pages under it: a docs section does, while a lone landing page like /welcome doesn't, and
+    the whole site is crawled then. Deeper folders are left to SiteLayout's version scoping.
+    """
+    kept: list[str] = []
+    for segment in path_segments(home.url):
+        kept.append(segment)
+        if not (is_locale(segment) or is_version(segment)):
+            folder = "/" + "".join(part + "/" for part in kept)
+            under = (link for link in home.links if link != home.url)
+            if any("/".join(path_segments(link)).startswith(folder[1:]) for link in under):
+                return folder
+            break
+    return "/"
 
 
 async def load_robots(fetcher: Fetcher, origin: str) -> RobotFileParser:
@@ -181,7 +208,7 @@ async def fetch_homepage(fetcher: Fetcher, origin: str) -> FetchResult:
             f"{origin} leads to a private or internal network address, so it can't be crawled."
         ) from None
     except FetchError as error:
-        if error.status in (401, 403, 429):
+        if error.status in (*REFUSAL_STATUSES, 429):
             reason = f"it answered HTTP {error.status}; the site may block automated access"
         else:
             reason = str(error)
@@ -228,11 +255,15 @@ def describe_pages(site: Site, crawl: Crawl) -> list[PageInfo]:
         if page.title and (folder := _top_folder(crawl.layout, page.url)):
             folder_titles.setdefault(folder, []).append(page.title)
     folder_boilerplate = {folder: shared_title_parts(t) for folder, t in folder_titles.items()}
-    describe = _describer([site.home, *listable.values()])
+    describe = _describer([site.home, *listable.values()], crawl.layout)
+    shell_title = crawl.shell_title()  # most pages are one empty shell: its title names none
     infos = []
     for url, page in listable.items():
         strip = boilerplate | folder_boilerplate.get(_top_folder(crawl.layout, url), set())
-        title = page_title(page.title, site.name, url, strip, site.home.title)
+        if shell_title is not None and is_empty_shell(page) and (page.title or "") == shell_title:
+            title = title_from_path(url)
+        else:
+            title = page_title(page.title, site.name, url, strip, site.home.title)
         infos.append(PageInfo(url=url, title=title, description=describe(page, title), section=""))
     return infos  # sections are filled in by build_sections
 
@@ -242,17 +273,26 @@ def _top_folder(layout: SiteLayout, url: str) -> str | None:
     return segments[0] if segments else None
 
 
-def _own_paragraphs(page: Page) -> list[str]:
-    """Paragraphs that may describe the page: none on a hub page (nearly all links).
+def _own_paragraphs(page: Page, layout: SiteLayout) -> list[str]:
+    """Paragraphs that may describe the page: none on a hub (nearly all links) or a feed.
 
-    A hub's text is teasers for today's items. Its meta description, if any, is stable; its
-    paragraphs aren't, and a description that changed daily would make monitoring store a
-    new version every day.
+    Their paragraphs introduce the latest items. Their meta description, if any, is stable;
+    their paragraphs aren't, and a description that changed daily would make monitoring
+    store a new version every day.
     """
-    return [] if page.is_hub else page.paragraphs
+    return [] if page.is_hub or _is_feed(page, layout) else page.paragraphs
 
 
-def _describer(pages: list[Page]) -> Callable[[Page, str], str | None]:
+def _is_feed(page: Page, layout: SiteLayout) -> bool:
+    """A page listing many dated or numbered items: a blog's front page, a news section.
+
+    Measured: feeds link to 37-599 such items (The Verge's sections, simonwillison.net,
+    jvns.ca, BBC Arts); articles to 3-16 (related stories); docs pages to 0-1.
+    """
+    return sum(layout.is_item(link) for link in page.links) >= FEED_MIN_ITEMS
+
+
+def _describer(pages: list[Page], layout: SiteLayout) -> Callable[[Page, str], str | None]:
     """Pick each page's description: its meta description, else its first paragraphs.
 
     Text that several pages share (the homepage's description copied site-wide by a CMS, an
@@ -260,11 +300,14 @@ def _describer(pages: list[Page]) -> Callable[[Page, str], str | None]:
     next choice.
     """
     counts = Counter(
-        text for page in pages for text in {page.description, *_own_paragraphs(page)} if text
+        text
+        for page in pages
+        for text in {page.description, *_own_paragraphs(page, layout)}
+        if text
     )
 
     def describe(page: Page, title: str) -> str | None:
-        for text in (page.description, *_own_paragraphs(page)):
+        for text in (page.description, *_own_paragraphs(page, layout)):
             if text and counts[text] == 1 and not _echoes(text, title):
                 return text
         return None
