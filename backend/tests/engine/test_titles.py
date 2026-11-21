@@ -7,6 +7,7 @@ from app.engine.titles import (
     page_title,
     shared_title_parts,
     site_name_from_title,
+    title_from_path,
 )
 
 ORIGIN = "https://example.com"
@@ -26,6 +27,7 @@ ORIGIN = "https://example.com"
         ("Home Chef | Meal Kit Delivery", "www.homechef.com", "Home Chef"),
         ("Welcome to GOV.UK", "www.gov.uk", "GOV.UK"),  # "Welcome to" always goes
         ("</> htmx - high power tools for html", "htmx.org", "htmx"),  # decorative symbols go
+        ("Svelte • Web development for the rest of us", "svelte.dev", "Svelte"),  # "•" splits
         ("Black & Decker", "blackanddecker.com", "Black & Decker"),  # a symbol inside is kept
         ("Acme", "acme.com", "Acme"),
         (None, "acme.com", None),
@@ -41,6 +43,10 @@ def test_site_name_from_title(title, hostname, expected):
         ("Pricing | Acme", "Pricing"),
         ("Acme - Pricing", "Pricing"),
         ("Acme ~ Pricing", "Pricing"),
+        ("Pricing • Acme", "Pricing"),
+        ("</> Acme ~ Pricing", "Pricing"),  # "</> Acme" is the site name all the same
+        ("</> Pricing", "Pricing"),  # symbol-only prefixes go
+        ("</>", "Getting started"),
         ("Pricing and plans", "Pricing and plans"),
         ("Acme", "Getting started"),  # only the site name: fall back to the URL
         (None, "Getting started"),
@@ -74,9 +80,24 @@ def test_few_titles_are_not_enough_evidence():
     assert shared_title_parts(["A | MDN", "B | MDN"]) == set()
 
 
-def test_shared_part_never_empties_a_title():
-    shared = {"mdn"}
-    assert page_title("MDN", "Mozilla", f"{ORIGIN}/x", shared) == "MDN"
+def test_a_page_titled_like_the_homepage_falls_back_to_the_path():
+    """Regression (Patagonia): pages titled only with the homepage's title were listed as
+    "Patagonia Outdoor Clothing & Gear (Womens)"."""
+    home = "Patagonia Outdoor Clothing & Gear"
+    assert page_title(home, "Patagonia", f"{ORIGIN}/shop/womens", home_title=home) == "Womens"
+    sitemap = page_title(f"Sitemap | {home}", "Patagonia", f"{ORIGIN}/sitemap/", home_title=home)
+    assert sitemap == "Sitemap"
+    # Codes at the end of the path give way to the words before them.
+    product = f"{ORIGIN}/product/the-wolverine-way-paperback-book/BK212.html"
+    assert (
+        page_title(home, "Patagonia", product, home_title=home)
+        == "The wolverine way paperback book"
+    )
+
+
+def test_a_title_that_is_only_a_shared_part_is_kept():
+    # The landing page of the section whose pages all end in "| Python Software Foundation".
+    assert page_title("MDN", "Mozilla", f"{ORIGIN}/x", {"mdn"}) == "MDN"
 
 
 def test_duplicate_titles_get_a_path_hint():
@@ -95,6 +116,37 @@ def test_duplicate_titles_get_a_path_hint():
         "Introduction (2.x)",
         "Introduction (3.0.1)",
         "Setup",
+    ]
+
+
+def test_path_hints_skip_id_segments():
+    """Regression (Linear): job posts got hints like "(069c4628 88d7 4e4d b393 ...)"."""
+
+    def info(path, title):
+        return PageInfo(f"{ORIGIN}{path}", title, None, "Careers")
+
+    uuid = "069c4628-88d7-4e4d-b393-c996fc7f3076"
+    pages = [
+        info(f"/careers/{uuid}", "Engineer"),
+        info("/careers/d3bc1ced-3ce4-4086-a050-555055dbb1ff", "Engineer"),
+        info("/news/1030441/permitting-bill", "Story"),
+        info("/news/1038597/senate-vote", "Story"),
+        info("/2024/recap", "Recap"),
+        info("/2025/recap", "Recap"),
+    ]
+    sections = [("Careers", pages)]
+
+    def segments(url):
+        return [s for s in url.removeprefix(ORIGIN).split("/") if s]
+
+    titles = [p.title for p in add_path_hints(sections, segments)[0][1]]
+    assert titles == [
+        "Engineer",  # nothing but the ID tells these apart: no hint beats a UUID
+        "Engineer",
+        "Story (Permitting bill)",  # the slug after a numeric ID does
+        "Story (Senate vote)",
+        "Recap (2024)",  # years aren't IDs
+        "Recap (2025)",
     ]
 
 
@@ -139,3 +191,43 @@ def test_path_hint_that_repeats_the_title_is_dropped():
 )  # fmt: skip
 def test_choose_site_name(og, alternatives, title, expected):
     assert choose_site_name(og, alternatives, title, "www.theguardian.com") == expected
+
+
+def test_og_site_name_that_is_just_the_hostname_is_skipped():
+    """Regression (fastht.ml): og:site_name "fastht.ml" made the H1 the hostname."""
+    title = "FastHTML - Modern web applications in pure Python"
+    assert choose_site_name("fastht.ml", [], title, "fastht.ml") == "FastHTML"
+    assert choose_site_name("www.Acme.com", [], "Acme | Widgets", "www.acme.com") == "Acme"
+    assert choose_site_name("fastht.ml", [], None, "fastht.ml") == "fastht.ml"
+
+
+def test_a_page_titled_exactly_like_the_homepage_falls_back_even_without_the_site_name():
+    """Regression: an app shell titled "Acme • The app for widgets" with og:site_name "Acme Inc"
+    gave "Acme (Dashboard)" while the warning said titles came from the URLs."""
+    shell = "Acme • The app for widgets"
+    shared = {"acme", "the app for widgets"}  # every shell page carries both parts
+    url = f"{ORIGIN}/dashboard"
+    assert page_title(shell, "Acme Inc", url, shared, home_title=shell) == "Dashboard"
+    # Content pages that all reuse the homepage's title: what's left is boilerplate too.
+    reused = "Acme | Widgets for everyone"
+    url = f"{ORIGIN}/about"
+    assert page_title(reused, "Acme", url, {"widgets for everyone"}, home_title=reused) == "About"
+    # ...but what's left after the site name still names the page (semver.org/spec).
+    spec = "Semantic Versioning 2.0.0 | Semantic Versioning"
+    url = f"{ORIGIN}/spec/v2.0.0.html"
+    assert (
+        page_title(spec, "Semantic Versioning", url, home_title=spec) == "Semantic Versioning 2.0.0"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/solutions/ai", "Ai"),  # short words without digits are words
+        ("/changelog/page/2", "Page"),  # a page number is a code
+        ("/product/wolverine-way/BK212.html", "Wolverine way"),  # so is a SKU
+        ("/careers/069c4628-88d7-4e4d-b393-c996fc7f3076", "Careers"),  # and a UUID
+    ],
+)
+def test_path_titles_skip_codes_but_not_short_words(path, expected):
+    assert title_from_path(f"{ORIGIN}{path}") == expected

@@ -51,6 +51,13 @@ MONTH = re.compile(
     r"^(0?[1-9]|1[0-2]|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february"
     r"|march|april|june|july|august|september|october|november|december)$"
 )  # /2026/11/... and /2026/nov/... (the Guardian)
+# Path segments that are database IDs, not words: UUIDs, hex hashes (with at least one digit,
+# so words like "facade" stay), and long numbers (/news/1030441/...). Four-digit numbers are
+# kept: they're usually years, which make useful hints.
+ID_SEGMENT = re.compile(
+    r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^(?=[a-f]*\d)[0-9a-f]{8,}$|^\d{5,}$",
+    re.IGNORECASE,
+)
 DATE_IN_SLUG = re.compile(r"(19|20)\d{2}[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
 
 
@@ -85,12 +92,16 @@ class SiteLayout:
     dominant_folder: str | None = None
 
     @classmethod
-    def detect(cls, home: Page, site_name: str, urls: list[str]) -> "SiteLayout":
-        """Work out the layout from the homepage (after redirects) and the discovered URLs."""
+    def detect(cls, home: Page, site_name: str, urls: list[str], base: str = "/") -> "SiteLayout":
+        """Work out the layout from the homepage (after redirects) and the discovered URLs.
+
+        `base` is a folder the crawl must stay in, when the site we were asked about lives in
+        a folder of another one (docs.pydantic.dev -> pydantic.dev/docs/).
+        """
         # If the homepage redirected into locale or version folders (/en/latest/, /en-US/),
         # those folders hold the copy the site wants us to see: scope the crawl to them.
-        kept: list[str] = []
-        for segment in path_segments(home.url):
+        kept = path_segments(base)
+        for segment in path_segments(home.url)[len(kept) :]:
             if not (is_locale(segment) or is_version(segment)):
                 break
             kept.append(segment)
@@ -99,7 +110,9 @@ class SiteLayout:
         home_locale = kept[0] if kept and is_locale(kept[0]) else None
         # hreflang alternates are the site saying "this page in other languages lives here".
         # Other-language pages elsewhere are caught by their <html lang> (see unique_pages).
+        # The base's own folder never counts: its translations (/docs/de/) are inside it.
         folders = {segments[0] for url in home.alternates if (segments := path_segments(url))}
+        folders -= set(path_segments(base)[:1])
         # The brand: the domain's label, and the site name when it's one word. A longer name
         # ("MDN Web Docs") is made of ordinary words that also name real sections.
         host_label = (urlsplit(home.url).hostname or "").removeprefix("www.").split(".")[0]
@@ -107,7 +120,7 @@ class SiteLayout:
         brand = {host_label} | (set(name_words) if len(name_words) == 1 else set())
         layout = cls(
             scope=scope,
-            strict_scope=any(is_version(segment) for segment in kept),
+            strict_scope=base != "/" or any(is_version(segment) for segment in kept),
             home_locale=home_locale,
             other_locales=frozenset(folders - {home_locale}),
             brand_words=frozenset(brand),
@@ -185,6 +198,11 @@ class SiteLayout:
         """The page with docs-version folders removed: /docs/3.0.1/intro and /docs/intro match."""
         kept = [segment for segment in self.segments(url) if not is_version(segment)]
         return "/".join(kept) + "?" + urlsplit(url).query
+
+    def is_item(self, url: str) -> bool:
+        """A post, story or record: a dated URL, or one with an ID in its path
+        (/news/1038597/..., /careers/<uuid>). Sites add these daily."""
+        return self.is_dated(url) or any(ID_SEGMENT.match(s) for s in path_segments(url))
 
     def is_dated(self, url: str) -> bool:
         segments = self.segments(url)

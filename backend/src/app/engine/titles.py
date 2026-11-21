@@ -6,10 +6,12 @@ from collections.abc import Callable
 from dataclasses import replace
 from urllib.parse import unquote, urlsplit
 
+from app.engine.layout import ID_SEGMENT
 from app.engine.models import PageInfo
 
-# How titles join a page name and a site name: "Pricing | Acme", "Acme - Docs", "</> htmx ~ Docs".
-TITLE_SEPARATOR = re.compile(r"\s+[|\-–—·:»~]+\s+")
+# How titles join a page name and a site name: "Pricing | Acme", "Acme - Docs", "</> htmx ~ Docs",
+# "Routing • SvelteKit Docs".
+TITLE_SEPARATOR = re.compile(r"\s+[|\-–—·•:»~]+\s+")
 # File extensions that say nothing in a title made from a URL ("intro.html" -> "Intro").
 PAGE_EXTENSION = re.compile(r"\.(html?|php|aspx?|jsp)$", re.IGNORECASE)
 # Homepage title parts that are never the site's name, and prefixes that aren't part of it.
@@ -39,13 +41,16 @@ def choose_site_name(
     """The H1: og:site_name, else application-name or JSON-LD name, else the homepage title.
 
     Candidates after og:site_name must be short, or they're taglines: the hostname is used.
+    An og:site_name that is just the hostname ("fastht.ml") is skipped: the title usually
+    names the site properly ("FastHTML"), and the hostname is the last resort anyway.
     """
-    if site_name:
+    domain = hostname.removeprefix("www.")
+    if site_name and site_name.lower().removeprefix("www.") != domain:
         return site_name
     for candidate in [*alternatives, site_name_from_title(title, hostname)]:
         if candidate and len(candidate.split()) <= MAX_SITE_NAME_WORDS:
             return candidate
-    return hostname.removeprefix("www.")
+    return domain
 
 
 def site_name_from_title(title: str | None, hostname: str = "") -> str | None:
@@ -110,16 +115,35 @@ def shared_title_parts(titles: list[str]) -> set[str]:
 
 
 def page_title(
-    title: str | None, site_name: str, url: str, shared_parts: set[str] = frozenset()
+    title: str | None,
+    site_name: str,
+    url: str,
+    shared_parts: set[str] = frozenset(),
+    home_title: str | None = None,
 ) -> str:
     """Drop the site name and shared boilerplate from both ends ("Pricing | Acme" -> "Pricing").
 
-    Never empty: a page titled only with the site name falls back to its URL path.
+    Never empty: a page titled only with the site name, or with the homepage's whole title,
+    falls back to its URL path. Shops title catch-all pages with the homepage's title
+    (Patagonia: "Patagonia Outdoor Clothing & Gear"), and a JavaScript app's shell carries it
+    on every route. A title that is only a shared part stays: "Python Software Foundation"
+    is a fine name for the landing page of the section whose pages all end in it.
     """
     if title:
-        title = _strip_ends(title, {_comparable(site_name)} | shared_parts)
-        # A page titled only with the site name says nothing about the page.
-        if _comparable(title) != _comparable(site_name):
+        says_nothing = {_comparable(site_name), _comparable(home_title or site_name)}
+        if home_title and _comparable(title) == _comparable(home_title):
+            # The homepage's own title, made of site-wide parts, so shared parts would strip it
+            # down to a brand fragment ("Acme • The app for widgets" -> "Acme"). Only the site
+            # name comes off; if nothing else is left, the URL names the page (an app shell).
+            # semver.org/spec carries "Semantic Versioning 2.0.0 | Semantic Versioning" too.
+            rest = _strip_symbol_words(_strip_ends(title, {_comparable(site_name)}))
+            # ...unless that is boilerplate too: content pages that all reuse the homepage's
+            # "Acme | Widgets for everyone" mustn't become "Widgets for everyone (About)".
+            if rest and _comparable(rest) not in says_nothing | shared_parts:
+                return rest
+            return title_from_path(url)
+        title = _strip_symbol_words(_strip_ends(title, says_nothing | shared_parts))
+        if title and _comparable(title) not in says_nothing:  # "</> Docs" -> "Docs" above
             return title
     return title_from_path(url)
 
@@ -137,11 +161,24 @@ def _strip_ends(title: str, strip: set[str]) -> str:
 
 
 def title_from_path(url: str) -> str:
-    """ "/docs/getting-started" -> "Getting started", for pages with no usable title."""
-    segments = [segment for segment in urlsplit(url).path.split("/") if segment]
+    """ "/docs/getting-started" -> "Getting started", for pages with no usable title.
+
+    Codes at the end are skipped for the words before them: "/product/wolverine-way/BK212.html"
+    -> "Wolverine way", "/careers/<uuid>" -> "Careers".
+    """
+    segments = [PAGE_EXTENSION.sub("", unquote(s)) for s in urlsplit(url).path.split("/") if s]
     if not segments:
         return "Home"
-    return _readable(segments[-1]) or "Untitled"
+    named = [segment for segment in segments if not _is_code(segment)]
+    return _readable(named[-1] if named else segments[-1]) or "Untitled"
+
+
+def _is_code(segment: str) -> bool:
+    """An ID, SKU or page number ("BK212", "2", a UUID) rather than words: digits and no run
+    of three letters, or an ID_SEGMENT. Short words without digits ("ai", "ux") are words."""
+    if ID_SEGMENT.match(segment):
+        return True
+    return any(c.isdigit() for c in segment) and not re.search(r"[^\W\d_]{3}", segment)
 
 
 def add_path_hints(
@@ -173,11 +210,16 @@ def add_path_hints(
 
 
 def _distinguishing_segment(url: str, paths: dict[str, list[str]]) -> str | None:
-    """The first path segment of `url` that differs from every other URL at that position."""
+    """The first path segment of `url` that differs from every other URL at that position.
+
+    IDs are skipped: "(069c4628 88d7 4e4d ...)" tells a reader nothing. A later segment (a
+    slug after a numeric ID) may still tell the pages apart; if none does, there's no hint.
+    """
     mine = paths[url]
     others = [path for other, path in paths.items() if other != url]
     for index, segment in enumerate(mine):
-        if all(len(path) <= index or path[index] != segment for path in others):
+        differs = all(len(path) <= index or path[index] != segment for path in others)
+        if differs and not ID_SEGMENT.match(segment):
             return _readable(segment)
     return None
 
@@ -193,5 +235,8 @@ def _readable(segment: str) -> str:
 
 
 def _comparable(text: str) -> str:
-    """Case- and apostrophe-insensitive, since og:site_name and <title> often differ in both."""
-    return text.lower().replace("’", "'").strip()
+    """Case- and apostrophe-insensitive, since og:site_name and <title> often differ in both.
+
+    Decorative symbols at the ends don't count either: "</> htmx" is the site name "htmx".
+    """
+    return _strip_symbol_words(text).lower().replace("’", "'")

@@ -1,0 +1,3 @@
+# Eval outputs: generated per run, and hand-written llms.txt files are third-party content.
+out*/
+ref/

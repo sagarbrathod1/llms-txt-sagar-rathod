@@ -230,9 +230,10 @@ def test_unreachable_site_is_an_error():
         run(site)
 
 
-def test_bot_blocked_homepage_is_an_error():
-    with pytest.raises(GenerationError, match="HTTP 403"):
-        run(FakeSite({f"{ORIGIN}/": (403, {}, "")}))
+@pytest.mark.parametrize("status", [403, 406])
+def test_bot_blocked_homepage_is_an_error(status):
+    with pytest.raises(GenerationError, match=f"HTTP {status}; the site may block automated"):
+        run(FakeSite({f"{ORIGIN}/": (status, {}, "")}))
 
 
 def test_homepage_only_site_warns():
@@ -282,7 +283,12 @@ def test_crawl_delay_is_honored_and_reported():
     site = FakeSite(site_routes() | {f"{ORIGIN}/robots.txt": text("User-agent: *\nCrawl-delay: 9")})
     result = run(site)
     assert "Getting started" in result.llms_txt
-    assert any("asks for 9 s between requests" in w for w in result.warnings)
+    # The spacing actually used is stated: a long delay is capped (at 0.05 s in these tests).
+    assert any(
+        "asks for 9 s between requests, so pages were fetched one at a time, 0.05 s apart "
+        "(our maximum)" in w
+        for w in result.warnings
+    )
 
 
 def test_fetch_budget_fits_the_time_left():
@@ -621,6 +627,14 @@ def test_progress_only_moves_forward_and_ends_full():
 def test_description_repeating_the_title_is_dropped():
     routes = site_routes() | {f"{ORIGIN}/pricing": page("Pricing | Acme", "Pricing")}
     assert "- [Pricing](https://example.com/pricing)\n" in run(FakeSite(routes)).llms_txt
+    # Regression (svelte.dev): the title plus a suffix ("Routing • SvelteKit documentation").
+    echo = page("Pricing • Acme", "Pricing • Acme documentation")
+    routes = site_routes() | {f"{ORIGIN}/pricing": echo}
+    assert "- [Pricing](https://example.com/pricing)\n" in run(FakeSite(routes)).llms_txt
+    # ...but a longer remainder is content (gov.uk).
+    more = "Pricing - compare the plans, see what each includes and pay yearly to save"
+    routes = site_routes() | {f"{ORIGIN}/pricing": page("Pricing | Acme", more)}
+    assert f"- [Pricing](https://example.com/pricing): {more}\n" in run(FakeSite(routes)).llms_txt
 
 
 def test_summary_equal_to_the_site_name_is_dropped():
@@ -632,3 +646,201 @@ def test_detail_line_names_the_site_origin_not_the_redirected_homepage():
     routes = site_routes() | {f"{ORIGIN}/": redirect("/en/home"), f"{ORIGIN}/en/home": home()}
     text = run(FakeSite(routes)).llms_txt
     assert "Key pages of https://example.com/, grouped" in text
+
+
+def bot_check(title="Client Challenge"):
+    """What bot-protection services serve instead of the page, with HTTP 200."""
+    return page(title, body="<p>Please enable JavaScript to continue.</p>")
+
+
+def test_a_site_answering_with_bot_checks_is_an_error():
+    """Regression (Le Monde): 49 of 50 links were titled "Client Challenge", with no warning."""
+    routes = site_routes()
+    for url in [f"{ORIGIN}/docs/start", f"{ORIGIN}/docs/api", f"{ORIGIN}/pricing"]:
+        routes[url] = bot_check()
+    with pytest.raises(GenerationError, match=r'bot check \("Client Challenge"\) instead of 3'):
+        run(FakeSite(routes))
+
+
+def test_a_bot_check_homepage_is_an_error():
+    routes = site_routes() | {f"{ORIGIN}/": bot_check("Just a moment...")}
+    with pytest.raises(GenerationError, match="bot check .* instead of its homepage"):
+        run(FakeSite(routes))
+
+
+def test_a_few_bot_check_pages_are_left_out_and_counted_as_failures():
+    routes = site_routes() | {f"{ORIGIN}/pricing": bot_check("Attention Required! | Cloudflare")}
+    result = run(FakeSite(routes))
+    assert "Attention Required" not in result.llms_txt and "/pricing" not in result.llms_txt
+    assert result.pages_failed == 1  # a blocked recheck mustn't replace a good version
+    # Reported as what it was: bot checks aren't retried, unlike timeouts.
+    assert any("1 page(s) answered with a bot check" in w for w in result.warnings)
+    assert not any("couldn't be fetched" in w for w in result.warnings)
+
+
+def test_a_real_page_whose_title_looks_like_a_bot_check_is_kept():
+    """Regression: ddos-guard.net's homepage, "DDoS-Guard | Reliable DDoS Protection", was
+    reported as a bot check. A challenge page has no links into the site; a real page does."""
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(title="DDoS-Guard | Reliable DDoS Protection", links=NAV),
+        f"{ORIGIN}/docs/start": page("Access Denied - Troubleshooting | Acme", links=["/"]),
+        f"{ORIGIN}/docs/api": page("Just a Moment | A blog post", links=["/docs/start"]),
+    }
+    result = run(FakeSite(routes))
+    assert "[Access Denied - Troubleshooting]" in result.llms_txt
+    assert "[Just a Moment | A blog post]" in result.llms_txt
+    assert result.pages_failed == 0
+
+
+@pytest.mark.parametrize(
+    ("home_title", "shell_title"),
+    [
+        ("Acme • The app for widgets", "Acme • The app for widgets"),  # homepage is the shell
+        ("Acme – Project tracking", "Acme App"),  # a prerendered homepage, a different shell
+        ("Acme – Project tracking", "Page not found"),  # a stale sitemap of HTTP 200 404s
+        ("Acme – Project tracking", None),  # an untitled shell
+    ],
+)
+def test_identical_empty_pages_warn_and_are_titled_from_their_urls(home_title, shell_title):
+    """Regression (hoppscotch.io): every route serves the same empty shell, and all 43 links
+    were titled "Hoppscotch • Open source API development ecosystem". Pages that can't be
+    told apart are no evidence of a bot check, so this warns rather than fails."""
+    routes = {f"{ORIGIN}/": page(home_title, "Acme makes widgets.", links=NAV)}
+    routes |= {f"{ORIGIN}{path}": page(shell_title) for path in NAV}
+    result = run(FakeSite(routes))
+    assert sorted(p.title for p in result.pages) == ["Api", "Pricing", "Privacy", "Start"]
+    assert any("the same nearly empty page" in w and "may not exist" in w for w in result.warnings)
+
+
+def test_feed_pages_are_described_by_their_meta_description_or_not_at_all():
+    """Regression (The Verge, simonwillison.net): a section listing dated or numbered stories
+    was described by its latest story, so the file changed daily."""
+    stories = "".join(f'<a href="/news/{100000 + n}/story">Story {n}</a>' for n in range(30))
+    latest = "<p>The latest story of the day, which will be a different one tomorrow.</p>"
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(links=[*NAV, "/energy"]),
+        f"{ORIGIN}/energy": page("Energy | Acme", body=f"<main>{latest}{stories}</main>"),
+    }
+    text = run(FakeSite(routes)).llms_txt
+    assert "- [Energy](https://example.com/energy)\n" in text
+    assert "latest story" not in text
+
+
+def test_an_article_with_a_long_sidebar_of_stories_is_not_a_feed():
+    """Regression (krebsonsecurity.com, kubernetes.io's blog, Google Help): articles whose
+    sidebars list dozens of dated posts lost their own descriptions."""
+    sidebar = "".join(f'<a href="/2026/11/{n:02}/post">Post {n}</a>' for n in range(1, 31))
+    own = "<p>This article explains how the breach happened and what to do about it.</p>"
+    article = "/2026/11/19/the-breach"
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(links=[*NAV, article]),
+        f"{ORIGIN}{article}": page("The breach | Acme", body=f"<main>{own}{sidebar}</main>"),
+    }
+    text = run(FakeSite(routes)).llms_txt
+    assert "the-breach): This article explains how the breach happened" in text
+
+
+def test_hub_pages_are_described_by_their_meta_description_or_not_at_all():
+    """Regression (The Verge, BBC, Spiegel): a section front was described by the teaser of
+    today's top story, so the file, and its monitored version, changed daily."""
+    headlines = "".join(
+        f'<li><a href="/2026/11/{n}/story">Headline {n} today</a></li>' for n in range(20)
+    )
+    intro = "<p>The top story of the day, which will be a different one tomorrow morning.</p>"
+    card = '<div><h2><a href="/2026/11/9/story">Top story</a></h2>' + intro + "</div>"
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(links=[*NAV, "/news", "/sport"]),
+        f"{ORIGIN}/news": page("News | Acme", body=f"<main>{intro}<ul>{headlines}</ul></main>"),
+        f"{ORIGIN}/sport": page("Sport | Acme", "All the sport.", body=f"<main>{card}</main>"),
+    }
+    text = run(FakeSite(routes)).llms_txt
+    assert "- [News](https://example.com/news)\n" in text  # a hub: no paragraph
+    assert "- [Sport](https://example.com/sport): All the sport.\n" in text
+    assert "top story" not in text
+
+
+@pytest.mark.parametrize("landing", ["/docs/", "/docs", "/docs/intro"])
+def test_a_redirect_into_a_folder_of_another_site_scopes_the_crawl(landing):
+    """Regression (docs.pydantic.dev -> pydantic.dev/docs/, docs.linear.app -> linear.app/docs):
+    the whole other site was crawled, giving none of the docs the user asked about."""
+    other = "https://other.com"
+    docs = [f"{other}/docs/guide/p{n}" for n in range(6)]
+    routes = {
+        f"{ORIGIN}/": redirect(f"{other}{landing}"),
+        f"{other}{landing}": home(links=["/docs/guide/p0", "/pricing", "/blog/post"]),
+        f"{other}/sitemap.xml": urlset(*docs, f"{other}/pricing", f"{other}/careers"),
+        f"{other}/pricing": page("Pricing | Other"),
+        f"{other}/blog/post": page("Post | Other"),
+    }
+    routes |= {url: page(f"Page {url[-1]} | Acme") for url in docs}
+    site = FakeSite(routes)
+    result = run(site)
+    assert [p.url for p in result.pages if p.url.startswith(f"{other}/docs/guide/")] == docs
+    assert not any(url.endswith(("/pricing", "/careers", "/post")) for url in site.requests)
+    assert "Key pages of https://other.com/docs/, grouped" in result.llms_txt
+    assert any(
+        "redirects to https://other.com/docs, so that part of the site" in w
+        for w in result.warnings
+    )
+
+
+def test_a_redirect_to_a_lone_landing_page_of_another_site_crawls_that_site():
+    # /welcome links to nothing under /welcome/: it's a landing page, not a section.
+    other = "https://other.com"
+    routes = {
+        f"{ORIGIN}/": redirect(f"{other}/welcome"),
+        f"{other}/welcome": home(links=["/docs/start", "/pricing"]),
+        f"{other}/docs/start": page("Getting started | Acme"),
+        f"{other}/pricing": page("Pricing | Acme"),
+    }
+    result = run(FakeSite(routes))
+    assert {p.url for p in result.pages} == {f"{other}/docs/start", f"{other}/pricing"}
+    assert "Key pages of https://other.com/, grouped" in result.llms_txt
+
+
+def test_a_scoped_crawl_follows_links_when_the_sitemap_has_little_in_scope():
+    """Regression: 12 marketing URLs in the root sitemap made a crawl scoped to /docs/ pick
+    sitemap mode, which then had almost nothing to fetch, and listed one page."""
+    other = "https://other.com"
+    marketing = [f"{other}/m{n}" for n in range(12)]
+    routes = {
+        f"{ORIGIN}/": redirect(f"{other}/docs/"),
+        f"{other}/docs/": home(links=["/docs/a"]),
+        f"{other}/sitemap.xml": urlset(*marketing),
+        f"{other}/docs/a": page("A | Acme", links=["/docs/b"]),
+        f"{other}/docs/b": page("B | Acme", links=["/docs/c"]),
+        f"{other}/docs/c": page("C | Acme"),
+    }
+    result = run(FakeSite(routes))
+    assert [p.title for p in result.pages] == ["A", "B", "C"]
+
+
+def test_a_redirect_within_the_site_does_not_scope_the_crawl():
+    # Patagonia's homepage redirects to /home/; the rest of the site is still the site.
+    routes = site_routes() | {f"{ORIGIN}/": redirect("/home/"), f"{ORIGIN}/home/": home()}
+    assert "Getting started" in run(FakeSite(routes)).llms_txt
+
+
+def test_a_text_file_listed_as_a_sitemap_is_skipped_quietly():
+    """Regression (Pinecone): robots.txt lists llms.txt as a sitemap, which gave a confusing
+    "isn't valid sitemap XML" warning."""
+    rules = "User-agent: *\nAllow: /\nSitemap: https://example.com/llms.txt"
+    site = FakeSite(site_routes() | {f"{ORIGIN}/robots.txt": text(rules)})
+    result = run(site)
+    assert not any("sitemap XML" in w for w in result.warnings)
+    assert f"{ORIGIN}/llms.txt" not in site.requests
+
+
+def test_a_site_refusing_with_406_and_bot_checks_is_an_error():
+    """Regression (Le Monde, later): most pages answered HTTP 406, the rest a bot check, so
+    neither alone was a majority and a one-link file was published."""
+    routes = site_routes()
+    many = [f"/p{n}" for n in range(6)]
+    routes[f"{ORIGIN}/"] = home(links=[*NAV, *many])
+    routes |= {f"{ORIGIN}{path}": (406, {}, "") for path in many}
+    routes[f"{ORIGIN}/docs/start"] = bot_check()
+    routes[f"{ORIGIN}/docs/api"] = bot_check()
+    with pytest.raises(
+        GenerationError, match=r"blocking our crawler: 8 of the 10 .*406.*bot check"
+    ):
+        run(FakeSite(routes))

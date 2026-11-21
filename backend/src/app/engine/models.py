@@ -51,10 +51,10 @@ class GenerationResult:
     # pages_failed.
     pages_attempted: int
     # Pages we planned but couldn't get: failed even after a retry (timeouts, connection
-    # errors, 5xx, 429), refused (401, 403), or cut off by the run's time limit. A 404 isn't a
-    # failure: the page doesn't exist. On a recheck the worker skips versioning when
-    # pages_failed / pages_attempted is too high, so an outage, a block or a truncated run
-    # doesn't replace a complete version.
+    # errors, 5xx, 429), refused (401, 403, 406, or a bot check), or cut off by the run's
+    # time limit. A 404 isn't a failure: the page doesn't exist. On a recheck the worker
+    # skips versioning when pages_failed / pages_attempted is too high, so an outage, a block
+    # or a truncated run doesn't replace a complete version.
     pages_failed: int
     # Non-fatal problems worth showing the user (e.g. "robots.txt disallows /docs").
     warnings: list[str] = field(default_factory=list)
