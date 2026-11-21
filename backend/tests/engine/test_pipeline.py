@@ -9,7 +9,7 @@ import pytest
 from fakesite import FakeSite, page, redirect, text, urlset
 from reference_parser import assert_round_trips
 
-from app.engine import crawl, extract, fetch, pipeline
+from app.engine import crawl, extract, fetch, pipeline, rank
 from app.engine.models import GenerationError
 
 ORIGIN = "https://example.com"
@@ -844,3 +844,184 @@ def test_a_site_refusing_with_406_and_bot_checks_is_an_error():
         GenerationError, match=r"blocking our crawler: 8 of the 10 .*406.*bot check"
     ):
         run(FakeSite(routes))
+
+
+def test_docs_on_a_marketing_site_get_their_own_budget():
+    """Regression (Vercel, Linear, Supabase): dozens of shallow marketing pages, linked from
+    every page, outranked the docs, which got 6 of 50 links as a single section."""
+    marketing = [f"/product-{n}" for n in range(40)]
+    areas = ["functions", "storage", "cli"]
+    docs = [f"/docs/{area}/p{n}" for area in areas for n in range(12)]
+    routes = {
+        f"{ORIGIN}/": home(links=[*marketing, "/docs"]),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in [*marketing, *docs])),
+        f"{ORIGIN}/docs": page("Docs | Acme", links=[f"/docs/{area}/p0" for area in areas]),
+    }
+    routes |= {ORIGIN + p: page(f"{p} | Acme", links=[*marketing, "/docs"]) for p in marketing}
+    routes |= {ORIGIN + path: page(f"{path} | Acme", links=["/docs"]) for path in docs}
+    pages = run(FakeSite(routes)).pages
+    listed_docs = [p.url for p in pages if "/docs/" in p.url]
+    assert len(listed_docs) == rank.MAX_DOCS_PAGES - 1  # plus /docs itself
+    # Spread across the docs' areas, each its own section.
+    assert {p.section for p in pages if "/docs/" in p.url} == {"Functions", "Storage", "CLI"}
+    assert len(pages) == rank.MAX_PAGES  # the rest of the site fills the rest
+
+
+def test_every_area_of_a_scoped_docs_site_gets_its_turn():
+    """Regression (docs.pydantic.dev): the other products filled their 15-link caps and
+    Pydantic Validation got none."""
+    other = "https://other.com"
+    products = ("ai", "logfire", "httpx", "monty")  # 4 x 15 links would fill all 50
+    big = [f"/docs/{product}/p{n}" for product in products for n in range(20)]
+    small = [f"/docs/validation/p{n}" for n in range(4)]
+    routes = {
+        f"{ORIGIN}/": redirect(f"{other}/docs/"),
+        f"{other}/docs/": home(links=big[:3]),
+        f"{other}/sitemap.xml": urlset(*(other + path for path in [*big, *small])),
+    }
+    routes |= {other + path: page(f"{path} | Acme", links=big) for path in big}  # well linked
+    routes |= {other + path: page(f"{path} | Acme") for path in small}
+    pages = run(FakeSite(routes)).pages
+    assert "Validation" in {p.section for p in pages}
+
+
+def test_without_a_sitemap_the_dominant_folder_is_judged_after_the_crawl():
+    """Regression (hono.dev): the homepage's few links showed no folder holding most of the
+    site, so its biggest folder stayed one capped section."""
+    wiki = [f"/wiki/{area}/p{n}" for area in ("setup", "usage") for n in range(8)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/wiki", "/about", "/pricing"]),
+        f"{ORIGIN}/wiki": page("Wiki | Acme", links=wiki),
+        f"{ORIGIN}/about": page("About | Acme"),
+        f"{ORIGIN}/pricing": page("Pricing | Acme"),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in wiki}
+    sections = {p.section for p in run(FakeSite(routes)).pages}
+    assert {"Setup", "Usage"} <= sections
+
+
+def test_sitemap_folders_nothing_links_to_get_no_turn_to_be_fetched(monkeypatch):
+    """Regression (gov.uk): an even share for each of 41 sitemap folders fetched 1988
+    air-accident reports and tribunal decisions, which then filled sections."""
+    monkeypatch.setattr(crawl, "MAX_PAGES_FETCHED", 12)
+    services = [f"/services/s{n}" for n in range(10)]
+    records = [f"/{folder}/r{n}" for folder in ("reports", "decisions") for n in range(10)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/services", "/about"]),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in [*records, *services])),
+        f"{ORIGIN}/services": page("Services | Acme", links=services),
+        f"{ORIGIN}/about": page("About | Acme"),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in [*services, *records]}
+    site = FakeSite(routes)
+    run(site)
+    assert not any("/reports/" in url or "/decisions/" in url for url in site.requests)
+    assert sum("/services/s" in url for url in site.requests) == 9  # the rest of the budget
+
+
+def test_a_blog_lists_its_posts_not_its_archives():
+    """Regression (simonwillison.net): 25 year archives and 15 tag pages, and no posts."""
+    years = [f"/{year}/" for year in range(2001, 2026)]
+    tags = [f"/tags/t{n}/" for n in range(10)]
+    posts = [f"/2026/nov/{day}/post-{day}/" for day in range(1, 13)]
+    links = [*years, *tags, *posts, "/about/"]
+    routes = {
+        f"{ORIGIN}/": home(links=links),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in links)),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme", links=links) for path in links}
+    urls = [p.url.removeprefix(ORIGIN) for p in run(FakeSite(routes)).pages]
+    assert sum(url in tags for url in urls) == rank.MAX_LISTING_PAGES
+    assert not set(urls) & set(years)
+    assert sum(url in posts for url in urls) == rank.MAX_DATED_PAGES
+    assert "/about/" in urls
+
+
+def test_job_postings_are_capped():
+    """Regression (linear.app): five job postings filled half of Optional."""
+    jobs = [f"/careers/{n:08x}-1111-2222-3333-444444444444" for n in range(5)]
+    routes = {f"{ORIGIN}/": home(links=["/about", "/team", "/careers", *jobs])}
+    routes |= {
+        ORIGIN + path: page(f"{path} | Acme") for path in ["/about", "/team", "/careers", *jobs]
+    }
+    optional = [
+        p.url.removeprefix(ORIGIN) for p in run(FakeSite(routes)).pages if p.section == "Optional"
+    ]
+    assert optional[0] == "/careers"
+    assert sum(url in jobs for url in optional) == rank.MAX_JOB_PAGES
+
+
+def test_policy_pages_with_extensions_or_in_other_languages_go_to_optional():
+    """Regression (Patagonia's /privacy-notice.html, Spiegel's /datenschutz in main sections)."""
+    links = ["/privacy-notice.html", "/datenschutz", "/mentions-legales", "/about", "/team"]
+    routes = {f"{ORIGIN}/": home(links=links)}
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in links}
+    pages = run(FakeSite(routes)).pages
+    optional = {p.url.removeprefix(ORIGIN) for p in pages if p.section == "Optional"}
+    assert optional == {"/privacy-notice.html", "/datenschutz", "/mentions-legales"}
+
+
+def test_a_page_that_redirects_to_a_login_page_is_left_out():
+    """Regression (python.org): /accounts/ redirected to /accounts/login/?next=..., a URL the
+    crawl would never have fetched, and the login page was listed."""
+    routes = site_routes() | {
+        f"{ORIGIN}/": home(links=[*NAV, "/account-area"]),
+        f"{ORIGIN}/account-area": redirect("/members/login/?next=/account-area"),
+        f"{ORIGIN}/members/login/?next=/account-area": page("Sign in | Acme"),
+    }
+    result = run(FakeSite(routes))
+    assert "Sign in" not in result.llms_txt
+    assert any("redirects to a page this crawl leaves out" in w for w in result.warnings)
+
+
+def test_a_page_fetched_from_the_homepage_is_not_fetched_again_from_the_sitemap():
+    # The homepage links /docs and the sitemap lists /docs/: the same page, fetched once.
+    docs = [f"{ORIGIN}/docs/p{n}" for n in range(12)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/docs"]),
+        f"{ORIGIN}/sitemap.xml": urlset(f"{ORIGIN}/docs/", *docs),
+        f"{ORIGIN}/docs": page("Docs | Acme"),
+        f"{ORIGIN}/docs/": page("Docs | Acme"),
+    }
+    routes |= {url: page(f"Page {url[-2:]} | Acme") for url in docs}
+    site = FakeSite(routes)
+    run(site)
+    assert sum(url in (f"{ORIGIN}/docs", f"{ORIGIN}/docs/") for url in site.requests) == 1
+
+
+def test_a_stores_guides_do_not_get_the_docs_budget():
+    """Review repro: a store's /guides/ (size charts) took 30 of 50 links before the products
+    were ranked. Only a folder named like docs, linked from the homepage and holding a real
+    share of the site, gets that budget."""
+    guides = [
+        f"/guides/{area}/g{n}" for area in ("size-fit", "care", "layering") for n in range(10)
+    ]
+    products = [f"/product-{n}" for n in range(40)]
+    routes = {
+        f"{ORIGIN}/": home(links=["/guides", *products]),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in [*guides, *products])),
+        f"{ORIGIN}/guides": page("Guides | Acme", links=guides),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme", links=products) for path in products}
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in guides}
+    urls = [p.url.removeprefix(ORIGIN) for p in run(FakeSite(routes)).pages]
+    assert sum(url in products for url in urls) > sum(url in guides for url in urls)
+
+
+def test_a_homepage_full_of_stories_cannot_use_up_the_fetch_budget(monkeypatch):
+    """Review repro (Ars Technica): 160 dated story links on the homepage took 94 of 99
+    fetches, though at most 5 can be listed, and the sitemap's evergreen pages weren't
+    reached."""
+    monkeypatch.setattr(crawl, "MAX_PAGES_FETCHED", 30)
+    stories = [f"/2026/11/{day:02}/story-{n}" for day in range(1, 21) for n in range(2)]
+    sections = [f"/sections/s{n}" for n in range(15)]
+    routes = {
+        f"{ORIGIN}/": home(links=stories),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in sections)),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme") for path in [*stories, *sections]}
+    site = FakeSite(routes)
+    run(site)
+    fetched_stories = sum(any(url.endswith(path) for path in stories) for url in site.requests)
+    assert fetched_stories == 2 * rank.MAX_DATED_PAGES  # FETCH_CAPS
+    assert all(ORIGIN + path in site.requests for path in sections)

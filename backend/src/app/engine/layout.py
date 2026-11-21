@@ -8,6 +8,7 @@ those copies would crowd the real pages out of llms.txt, so this module identifi
 import re
 from collections import Counter
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from app.engine.extract import Page
@@ -27,6 +28,10 @@ ISO_639_1 = set(
 LOCALE = re.compile(r"^([a-z]{2})(?:[-_]([a-z]{2,4}|\d{3}))?$")
 # A version folder: 2.x, 3.0.1, v2, 2.0.0-alpha.30.
 VERSION = re.compile(r"^v?\d+(\.[\w-]+)+$|^v\d+$")
+# API versions named by date, 2025-04 or 2024-06-20 (Pinecone, Stripe): each a whole copy of
+# the API reference. Only in docs (see SiteLayout.without_versions): elsewhere a dated folder
+# is a changelog entry or a newsletter issue, not a copy.
+DATE_VERSION = re.compile(r"^(19|20)\d{2}-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?$")
 # Names docs sites give their moving versions. Each is a whole copy of the docs.
 VERSION_ALIASES = {"latest", "stable", "next", "current", "nightly", "canary", "unreleased"}
 # Build output of docs generators (Sphinx's _modules, _sources, genindex) and search pages:
@@ -36,8 +41,6 @@ JUNK_SEGMENTS = {"_images", "_modules", "_sources", "_static", "genindex", "py-m
 # Query parameters that mean "go here after logging in": the URL is a login page.
 REDIRECT_PARAMS = {"next", "redirect", "redirect_to", "redirect_uri", "return", "return_to",
                    "returnto", "returnurl"}  # fmt: skip
-# Dated content (news, posts) changes daily; listing it would make the monitored llms.txt
-# churn even when nothing that matters changed. /2026/11/... or a date-stamped slug.
 # When one folder holds at least this share of a site's pages (MDN's /docs/, Docusaurus's
 # /docs/), grouping by it would give one giant section, so we group one level deeper.
 DOMINANT_FOLDER_SHARE = 0.6
@@ -45,12 +48,27 @@ DOMINANT_FOLDER_SHARE = 0.6
 MIN_URLS_FOR_DEEPER_GROUPING = 10
 # Archives are never grouped deeper: their subfolders are years or authors, not topics, and
 # a site whose pages are mostly posts should list a few, not dozens (nodejs.org's blog).
+# Listing folders (/tags/, see LISTING_SEGMENTS) aren't either.
 ARCHIVE_FOLDERS = {"articles", "blog", "changelog", "news", "posts", "press", "releases"}
+# Top folders named like documentation are grouped one level deeper, so docs with areas get
+# a section per area rather than one 15-link "Docs" (Vercel, Supabase, Hono).
+DOC_FOLDERS = {"api", "doc", "docs", "documentation", "guide", "guides", "learn", "reference"}
+# The names that mean documentation and little else. Only these can be the site's docs, which
+# get a budget of their own (rank.MAX_DOCS_PAGES): "guides" and "learn" are just as often
+# buying guides or a blog (Patagonia's /guides/ size charts).
+DOCS_NAMES = {"api", "doc", "docs", "documentation", "reference"}
+# ...and only when the homepage links into the folder and it holds at least this share of the
+# site's URLs. Measured: docs folders hold 10-90% (Linear 10%, Vercel 44%, Hono 75%); folders
+# that only share the name, under 1% (simonwillison.net's /guides/, 18 of 3,645 URLs).
+MIN_DOCS_SHARE = 0.05
+# Dated content (news, posts) changes daily; listing it would make the monitored llms.txt
+# churn even when nothing that matters changed. /2026/11/... or a date-stamped slug.
 YEAR = re.compile(r"^(19|20)\d{2}$")
 MONTH = re.compile(
     r"^(0?[1-9]|1[0-2]|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february"
     r"|march|april|june|july|august|september|october|november|december)$"
 )  # /2026/11/... and /2026/nov/... (the Guardian)
+DAY = re.compile(r"^(0?[1-9]|[12]\d|3[01])$")
 # Path segments that are database IDs, not words: UUIDs, hex hashes (with at least one digit,
 # so words like "facade" stay), and long numbers (/news/1030441/...). Four-digit numbers are
 # kept: they're usually years, which make useful hints.
@@ -58,6 +76,15 @@ ID_SEGMENT = re.compile(
     r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^(?=[a-f]*\d)[0-9a-f]{8,}$|^\d{5,}$",
     re.IGNORECASE,
 )
+# Listing pages that only repeat links to other pages.
+LISTING_SEGMENTS = {"archive", "archives", "author", "authors", "category", "categories",
+                    "tag", "tags"}  # fmt: skip
+# Categories are also a blog's or magazine's sections (WordPress's /category/<name>/), so
+# they're ranked like listings but not capped with them (see rank.MAX_LISTING_PAGES).
+CATEGORY_SEGMENTS = {"category", "categories"}
+# Page 2, 3, ... of a listing: /blog/page/2, ?page=3, ?paged=3. Only with a number: a
+# ?page=about is a page of its own, and WordPress's ?p=123 is a post.
+PAGE_PARAMS = {"page", "paged"}
 DATE_IN_SLUG = re.compile(r"(19|20)\d{2}[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
 
 
@@ -90,6 +117,11 @@ class SiteLayout:
     # A top folder holding most of the site (MDN's "docs"): its pages are grouped one level
     # deeper, by /docs/<folder>/, so it doesn't become one giant section.
     dominant_folder: str | None = None
+    # The crawl is scoped to a docs folder (docs.pydantic.dev -> pydantic.dev/docs/), so every
+    # page is documentation. Its top folders are already the docs' own areas.
+    docs_scope: bool = False
+    # Top folders that are the site's docs (see DOCS_NAMES), e.g. {"docs"}.
+    docs_folders: frozenset[str] = frozenset()
 
     @classmethod
     def detect(cls, home: Page, site_name: str, urls: list[str], base: str = "/") -> "SiteLayout":
@@ -124,8 +156,33 @@ class SiteLayout:
             home_locale=home_locale,
             other_locales=frozenset(folders - {home_locale}),
             brand_words=frozenset(brand),
+            docs_scope=any(segment in DOCS_NAMES for segment in kept),
         )
-        return replace(layout, dominant_folder=layout._dominant_folder(urls))
+        return layout.with_urls(urls, home.links)
+
+    def with_urls(self, urls: list[str], home_links: list[str]) -> "SiteLayout":
+        """This layout with its dominant folder and docs folders judged from `urls`.
+
+        Called again after a crawl that followed links: without a sitemap, the homepage's
+        links alone (15 on hono.dev) are too few to show which folder holds most of the site.
+        """
+        return replace(
+            self,
+            dominant_folder=self._dominant_folder(urls),
+            docs_folders=self._docs_folders(urls, home_links),
+        )
+
+    def _docs_folders(self, urls: list[str], home_links: list[str]) -> frozenset[str]:
+        """Top folders named like docs (DOCS_NAMES) that the homepage links into and that hold
+        at least MIN_DOCS_SHARE of the site's URLs: evidence the site treats them as its docs."""
+        tops = [self._top(url) for url in urls if not self.is_excluded(url)]
+        linked = {self._top(url) for url in home_links if not self.is_excluded(url)}
+        counts = Counter(top for top in tops if top in DOCS_NAMES & linked)
+        return frozenset(top for top, n in counts.items() if n >= len(tops) * MIN_DOCS_SHARE)
+
+    def _top(self, url: str) -> str | None:
+        segments = self.section_segments(url)
+        return segments[0] if segments else None
 
     def _dominant_folder(self, urls: list[str]) -> str | None:
         """The top folder holding most of the site's pages, if one does."""
@@ -138,7 +195,7 @@ class SiteLayout:
         if total < MIN_URLS_FOR_DEEPER_GROUPING:
             return None
         folder, count = tops.most_common(1)[0]
-        if folder in ARCHIVE_FOLDERS or count < total * DOMINANT_FOLDER_SHARE:
+        if folder in ARCHIVE_FOLDERS | LISTING_SEGMENTS or count < total * DOMINANT_FOLDER_SHARE:
             return None
         return folder
 
@@ -157,11 +214,32 @@ class SiteLayout:
 
     def section_segments(self, url: str) -> list[str]:
         """segments() without docs-version folders, which never make good section names."""
-        return [segment for segment in self.segments(url) if not is_version(segment)]
+        return self.without_versions(self.segments(url))
 
-    def is_in_dominant_folder(self, url: str) -> bool:
+    def without_versions(self, segments: list[str]) -> list[str]:
+        """`segments` without docs-version folders: 2.x, latest, and, in docs (a docs scope or
+        under a folder named like docs), API versions named by date (/reference/api/2025-04/)."""
+        in_docs = self.docs_scope or bool(segments) and segments[0] in DOCS_NAMES
+        return [
+            segment for segment in segments
+            if not (is_version(segment) or in_docs and DATE_VERSION.match(segment))
+        ]  # fmt: skip
+
+    def deep_folder(self, url: str) -> str | None:
+        """The page's top folder if that folder is grouped one level deeper: the dominant folder,
+        or a docs folder (/docs/, /guide/, /api/, ...). Within a docs scope the top folders are
+        already the docs' areas (/docs/ai/, /docs/logfire/), so none is grouped deeper."""
         segments = self.section_segments(url)
-        return bool(segments) and segments[0] == self.dominant_folder
+        if not segments:
+            return None
+        top = segments[0]
+        if top == self.dominant_folder or (top in DOC_FOLDERS and not self.docs_scope):
+            return top
+        return None
+
+    def is_docs(self, url: str) -> bool:
+        """The site's docs: anything in a docs scope, or under one of its docs_folders."""
+        return self.docs_scope or self._top(url) in self.docs_folders
 
     def is_excluded(self, url: str) -> bool:
         """Copies and junk: other versions or languages, build output, login pages."""
@@ -192,19 +270,58 @@ class SiteLayout:
         ]  # fmt: skip
 
     def is_versioned(self, url: str) -> bool:
-        return any(is_version(segment) for segment in self.segments(url))
+        segments = self.segments(url)
+        return len(self.without_versions(segments)) < len(segments)
 
     def version_free_key(self, url: str) -> str:
         """The page with docs-version folders removed: /docs/3.0.1/intro and /docs/intro match."""
-        kept = [segment for segment in self.segments(url) if not is_version(segment)]
-        return "/".join(kept) + "?" + urlsplit(url).query
+        return "/".join(self.section_segments(url)) + "?" + urlsplit(url).query
 
     def is_item(self, url: str) -> bool:
         """A post, story or record: a dated URL, or one with an ID in its path
         (/news/1038597/..., /careers/<uuid>). Sites add these daily."""
-        return self.is_dated(url) or any(ID_SEGMENT.match(s) for s in path_segments(url))
+        return self._is_dated_post(url) or any(ID_SEGMENT.match(s) for s in path_segments(url))
+
+    def is_listing(self, url: str) -> bool:
+        """A page that only lists other pages: tags, categories, authors, archives, page 2."""
+        if any(segment in LISTING_SEGMENTS for segment in self.segments(url)):
+            return True
+        return self.is_paginated(url) or self.is_date_archive(url)
+
+    def is_paginated(self, url: str) -> bool:
+        """Page 2, 3, ... of a listing: /blog/page/2, ?page=3, ?paged=3 (a number only)."""
+        if any(page == "page" and n.isdigit() for page, n in pairwise(self.segments(url))):
+            return True
+        query = parse_qsl(urlsplit(url).query)
+        return any(key.lower() in PAGE_PARAMS and value.isdigit() for key, value in query)
+
+    def is_category(self, url: str) -> bool:
+        """A category page itself, a blog's or magazine's section: /category/news/, but not
+        its page 2, which only repeats links like any other listing."""
+        segments = self.segments(url)
+        return any(s in CATEGORY_SEGMENTS for s in segments) and not self.is_paginated(url)
+
+    def is_date_archive(self, url: str) -> bool:
+        """A path ending in a year (and maybe a month and day): /2002/, /blog/2024/05/.
+
+        Only at the top or under an archive folder, so /products/1984 stays a product.
+        """
+        segments = self.segments(url)
+        # /2026/nov/20/ -> /2026/: drop a trailing day, then a month, after a year.
+        if len(segments) >= 3 and DAY.match(segments[-1]) and MONTH.match(segments[-2]):
+            segments = segments[:-1]
+        if len(segments) >= 2 and MONTH.match(segments[-1]) and YEAR.match(segments[-2]):
+            segments = segments[:-1]
+        if not segments or not YEAR.match(segments[-1]):
+            return False
+        return len(segments) == 1 or segments[-2] in ARCHIVE_FOLDERS
 
     def is_dated(self, url: str) -> bool:
+        """A dated post or story, or a date archive: both change as new posts come out.
+        (A date archive is a listing too, so it ranks below other listings.)"""
+        return self._is_dated_post(url) or self.is_date_archive(url)
+
+    def _is_dated_post(self, url: str) -> bool:
         segments = self.segments(url)
         for year, month in zip(segments, segments[1:], strict=False):
             if YEAR.match(year) and MONTH.match(month):
