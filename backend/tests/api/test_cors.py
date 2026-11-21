@@ -43,6 +43,10 @@ def test_production_origin_is_allowed(production):
     assert allowed(production, PRODUCTION)
 
 
+def test_local_dev_server_can_call_production(production):
+    assert allowed(production, "http://localhost:3000")
+
+
 @pytest.mark.parametrize(
     "origin",
     [
