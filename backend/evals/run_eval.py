@@ -7,6 +7,7 @@ Usage (from backend/):
     uv run python evals/run_eval.py                         # whole corpus, ~6 minutes
     uv run python evals/run_eval.py svelte hono             # sites whose URL contains these
     uv run python evals/run_eval.py --out evals/out-main    # e.g. a baseline from main
+    uv run python evals/run_eval.py --held-out              # only the held-out sites
 
 Sites run one at a time, with the engine's own limits (the same entry point as the worker),
 so the crawl stays polite and timings aren't skewed by each other.
@@ -24,7 +25,9 @@ needs are there), no_junk (no logins, bot checks, archives or random deep pages)
 coverage (the site's main areas are all represented).
 
 corpus.json lists each site with its category, why it was picked, and the URL of its own
-hand-written llms.txt if it has one (see compare.py).
+hand-written llms.txt if it has one (see compare.py). Sites marked "held_out" are never used
+to tune the engine: they're added after a change and only measured, so the summary reports
+them separately as the honest estimate of how the rules generalize.
 """
 
 import argparse
@@ -53,8 +56,12 @@ def slug(url: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", url.lower()).strip("-")
 
 
-def load_corpus(filters: list[str]) -> list[dict]:
+def load_corpus(filters: list[str], held_out: bool | None = None) -> list[dict]:
+    """The corpus, optionally only sites whose URL contains a filter, and only held-out
+    (held_out=True) or only tuned (held_out=False) sites."""
     corpus = json.loads((HERE / "corpus.json").read_text())
+    if held_out is not None:
+        corpus = [site for site in corpus if site.get("held_out", False) == held_out]
     if filters:
         corpus = [site for site in corpus if any(f in site["url"] for f in filters)]
     return corpus
@@ -137,27 +144,39 @@ def print_line(record: dict) -> None:
 
 
 def print_summary(records: list[dict]) -> None:
-    done = [record for record in records if record["ok"]]
-    conformant = [r for r in done if not r["lint"] and r["ref_parser"] == "ok"]
-    links = sum(r["metrics"]["links"] for r in done)
-    described = sum(r["metrics"]["with_desc"] for r in done)
-    print(
-        f"\n{len(done)}/{len(records)} succeeded, {len(conformant)}/{len(done)} conformant, "
-        f"{links} links, {described / max(links, 1):.0%} with a description, "
-        f"{sum(r['metrics']['dup_titles'] for r in done)} duplicate titles"
-    )
+    for label, held_out in (("tuned", False), ("held-out", True)):
+        group = [r for r in records if r.get("held_out", False) == held_out]
+        if not group:
+            continue
+        done = [record for record in group if record["ok"]]
+        conformant = [r for r in done if not r["lint"] and r["ref_parser"] == "ok"]
+        links = sum(r["metrics"]["links"] for r in done)
+        described = sum(r["metrics"]["with_desc"] for r in done)
+        print(
+            f"{label}: {len(done)}/{len(group)} succeeded, {len(conformant)}/{len(done)} "
+            f"conformant, {links} links, {described / max(links, 1):.0%} with a description, "
+            f"{sum(r['metrics']['dup_titles'] for r in done)} duplicate titles"
+        )
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("filters", nargs="*", help="only sites whose URL contains one of these")
     parser.add_argument("--out", type=Path, default=HERE / "out", help="output folder")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--held-out", dest="held_out", action="store_const", const=True, help="only held-out"
+    )
+    group.add_argument(
+        "--tuned", dest="held_out", action="store_const", const=False, help="only tuned sites"
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     records = []
-    for site in load_corpus(args.filters):
+    for site in load_corpus(args.filters, args.held_out):
         records.append(await run_site(site, args.out))
         print_line(records[-1])
+    print()
     print_summary(records)
 
 

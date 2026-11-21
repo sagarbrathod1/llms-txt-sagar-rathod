@@ -28,5 +28,18 @@
  {"url": "www.duolingo.com", "category": "JS SPA", "why": "consumer app, homepage empty without JS", "llms": null},
  {"url": "hoppscotch.io", "category": "JS SPA", "why": "dev-tool web app, homepage empty without JS", "llms": null},
  {"url": "jsonlines.org", "category": "small site", "why": "spec site, ~4 pages, broken sitemap", "llms": null},
- {"url": "semver.org", "category": "small site", "why": "one-page spec translated into ~40 languages", "llms": null}
+ {"url": "semver.org", "category": "small site", "why": "one-page spec translated into ~40 languages", "llms": null},
+ {"url": "docs.linear.app", "category": "docs redirect", "why": "redirects to linear.app/docs (no trailing slash); the review's repro", "llms": null},
+ {"url": "docs.vercel.com", "category": "docs redirect", "why": "redirects to vercel.com/docs", "llms": null},
+ {"url": "docs.supabase.com", "category": "docs redirect", "why": "redirects to supabase.com/docs", "llms": null},
+ {"url": "docs.cursor.com", "category": "docs redirect", "why": "redirects to cursor.com/docs", "llms": null},
+ {"url": "docs.render.com", "category": "docs redirect", "why": "redirects to render.com/docs", "llms": null, "held_out": true},
+ {"url": "docs.clerk.com", "category": "docs redirect", "why": "redirects to clerk.com/docs", "llms": null, "held_out": true},
+ {"url": "docs.planetscale.com", "category": "docs redirect", "why": "redirects to planetscale.com/docs", "llms": null, "held_out": true},
+ {"url": "docs.posthog.com", "category": "docs redirect", "why": "redirects to posthog.com/docs", "llms": null, "held_out": true},
+ {"url": "docs.mux.com", "category": "docs redirect", "why": "redirects to www.mux.com/docs/", "llms": null, "held_out": true},
+ {"url": "ddos-guard.net", "category": "bot-check-like brand", "why": "real homepage titled like a bot check (DDoS-Guard)", "llms": null, "held_out": true},
+ {"url": "martinfowler.com", "category": "blog / personal", "why": "long-running article site", "llms": null, "held_out": true},
+ {"url": "overreacted.io", "category": "blog / personal", "why": "statically generated blog", "llms": null, "held_out": true},
+ {"url": "www.bellroy.com", "category": "e-commerce", "why": "Shopify store", "llms": null, "held_out": true}
 ]
