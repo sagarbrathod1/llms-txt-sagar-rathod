@@ -19,8 +19,10 @@ kill_timeout = 10
 [env]
   # The $0 mode: no separate always-on worker; the loop runs only while this machine is up.
   EMBEDDED_WORKER = "true"
-  # Not a secret: the web app's origin, the only one browsers may call the API from.
-  CORS_ORIGINS = "https://llms-txt-sagar-rathod.vercel.app"
+  # Not secrets: the web app's origin, plus the local dev server so a frontend running on a
+  # laptop can try changes against real data. Safe because the API has no cookies or auth:
+  # CORS only limits which web pages may call it from a browser.
+  CORS_ORIGINS = "https://llms-txt-sagar-rathod.vercel.app,http://localhost:3000"
   # This project's Vercel preview deployments, so a PR's preview can use the API. Two shapes:
   # per deployment (a 9-character hash) and per branch ("git-" + branch). Anchored, and ending
   # in this account's scope slug, which only this account can deploy under.
