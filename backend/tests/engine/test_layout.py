@@ -115,3 +115,26 @@ def test_version_copies_go_when_a_current_twin_exists():
 def test_archive_folders_are_never_grouped_deeper():
     posts = [f"/blog/2024/p{n}" for n in range(14)]
     assert detect(urls=[*posts, "/learn/a", "/api/b"]).dominant_folder is None
+    # Nor are listing folders: martinfowler.com's homepage links to 72 tag pages.
+    tags = [f"/tags/t{n}.html" for n in range(14)]
+    assert detect(urls=[*tags, "/bliki/a", "/books/b"]).dominant_folder is None
+
+
+def test_listing_pages():
+    layout = detect()
+    listings = ["/tags/python/", "/blog/category/news", "/authors/jo", "/blog/page/2",
+                "/blog?page=3", "/2002/", "/2026/nov/", "/2026/11/20/",
+                "/blog/2024/05/"]  # fmt: skip
+    for path in listings:
+        assert layout.is_listing(ORIGIN + path), path
+    for path in ["/blog/how-to", "/2026/nov/20/a-post/", "/products/1984", "/docs/2024"]:
+        assert not layout.is_listing(ORIGIN + path), path
+
+
+def test_date_archives_are_dated_but_not_items():
+    layout = detect()
+    # A year archive changes as posts come out, like the posts themselves...
+    assert layout.is_dated(f"{ORIGIN}/2002/")
+    # ...but it's a listing, not a post: a page linking to many of them isn't a feed.
+    assert not layout.is_item(f"{ORIGIN}/2002/")
+    assert layout.is_item(f"{ORIGIN}/2026/11/20/a-post/")

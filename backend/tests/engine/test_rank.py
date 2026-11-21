@@ -202,3 +202,19 @@ def test_policy_pages_with_extensions_brand_names_or_in_other_languages():
     for path in ["/spiegel", "/stories.html", "/docs/privacy-features", "/datenschutz-tools/x",
                  "/tags/privacy.html"]:  # fmt: skip
         assert not r.is_low_value(ORIGIN + path), path
+
+
+def test_job_postings_are_capped_in_optional():
+    jobs = [f"/careers/{n:08x}-1111-2222-3333-444444444444" for n in range(5)]
+    sections = dict(sections_of(["/careers", *jobs, "/privacy", "/a", "/b"]))
+    assert sections["Optional"] == ["/careers", "/privacy", jobs[0], jobs[1]]
+
+
+def test_listing_pages_are_capped_and_dated_posts_fill_in_but_only_a_few():
+    years = [f"/{year}/" for year in range(2001, 2011)]
+    tags = [f"/tags/t{n}/" for n in range(6)]
+    posts = [f"/2026/nov/{day}/post-{day}/" for day in range(1, 11)]
+    listed = [url for _, urls in sections_of([*years, *tags, *posts, "/about"]) for url in urls]
+    assert sum(url.startswith("/tags/") for url in listed) == rank_module.MAX_LISTING_PAGES
+    assert not set(years) & set(listed)  # a date archive ranks below other listings
+    assert sum(url in posts for url in listed) == rank_module.MAX_DATED_PAGES

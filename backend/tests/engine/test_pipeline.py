@@ -9,7 +9,7 @@ import pytest
 from fakesite import FakeSite, page, redirect, text, urlset
 from reference_parser import assert_round_trips
 
-from app.engine import crawl, extract, fetch, pipeline
+from app.engine import crawl, extract, fetch, pipeline, rank
 from app.engine.models import GenerationError
 
 ORIGIN = "https://example.com"
@@ -844,6 +844,38 @@ def test_a_site_refusing_with_406_and_bot_checks_is_an_error():
         GenerationError, match=r"blocking our crawler: 8 of the 10 .*406.*bot check"
     ):
         run(FakeSite(routes))
+
+
+def test_a_blog_lists_its_posts_not_its_archives():
+    """Regression (simonwillison.net): 25 year archives and 15 tag pages, and no posts."""
+    years = [f"/{year}/" for year in range(2001, 2026)]
+    tags = [f"/tags/t{n}/" for n in range(10)]
+    posts = [f"/2026/nov/{day}/post-{day}/" for day in range(1, 13)]
+    links = [*years, *tags, *posts, "/about/"]
+    routes = {
+        f"{ORIGIN}/": home(links=links),
+        f"{ORIGIN}/sitemap.xml": urlset(*(ORIGIN + path for path in links)),
+    }
+    routes |= {ORIGIN + path: page(f"{path} | Acme", links=links) for path in links}
+    urls = [p.url.removeprefix(ORIGIN) for p in run(FakeSite(routes)).pages]
+    assert sum(url in tags for url in urls) == rank.MAX_LISTING_PAGES
+    assert not set(urls) & set(years)
+    assert sum(url in posts for url in urls) == rank.MAX_DATED_PAGES
+    assert "/about/" in urls
+
+
+def test_job_postings_are_capped():
+    """Regression (linear.app): five job postings filled half of Optional."""
+    jobs = [f"/careers/{n:08x}-1111-2222-3333-444444444444" for n in range(5)]
+    routes = {f"{ORIGIN}/": home(links=["/about", "/team", "/careers", *jobs])}
+    routes |= {
+        ORIGIN + path: page(f"{path} | Acme") for path in ["/about", "/team", "/careers", *jobs]
+    }
+    optional = [
+        p.url.removeprefix(ORIGIN) for p in run(FakeSite(routes)).pages if p.section == "Optional"
+    ]
+    assert optional[0] == "/careers"
+    assert sum(url in jobs for url in optional) == rank.MAX_JOB_PAGES
 
 
 def test_policy_pages_with_extensions_or_in_other_languages_go_to_optional():

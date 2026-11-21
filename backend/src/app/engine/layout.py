@@ -36,8 +36,6 @@ JUNK_SEGMENTS = {"_images", "_modules", "_sources", "_static", "genindex", "py-m
 # Query parameters that mean "go here after logging in": the URL is a login page.
 REDIRECT_PARAMS = {"next", "redirect", "redirect_to", "redirect_uri", "return", "return_to",
                    "returnto", "returnurl"}  # fmt: skip
-# Dated content (news, posts) changes daily; listing it would make the monitored llms.txt
-# churn even when nothing that matters changed. /2026/11/... or a date-stamped slug.
 # When one folder holds at least this share of a site's pages (MDN's /docs/, Docusaurus's
 # /docs/), grouping by it would give one giant section, so we group one level deeper.
 DOMINANT_FOLDER_SHARE = 0.6
@@ -45,12 +43,16 @@ DOMINANT_FOLDER_SHARE = 0.6
 MIN_URLS_FOR_DEEPER_GROUPING = 10
 # Archives are never grouped deeper: their subfolders are years or authors, not topics, and
 # a site whose pages are mostly posts should list a few, not dozens (nodejs.org's blog).
+# Listing folders (/tags/, see LISTING_SEGMENTS) aren't either.
 ARCHIVE_FOLDERS = {"articles", "blog", "changelog", "news", "posts", "press", "releases"}
+# Dated content (news, posts) changes daily; listing it would make the monitored llms.txt
+# churn even when nothing that matters changed. /2026/11/... or a date-stamped slug.
 YEAR = re.compile(r"^(19|20)\d{2}$")
 MONTH = re.compile(
     r"^(0?[1-9]|1[0-2]|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february"
     r"|march|april|june|july|august|september|october|november|december)$"
 )  # /2026/11/... and /2026/nov/... (the Guardian)
+DAY = re.compile(r"^(0?[1-9]|[12]\d|3[01])$")
 # Path segments that are database IDs, not words: UUIDs, hex hashes (with at least one digit,
 # so words like "facade" stay), and long numbers (/news/1030441/...). Four-digit numbers are
 # kept: they're usually years, which make useful hints.
@@ -58,6 +60,11 @@ ID_SEGMENT = re.compile(
     r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^(?=[a-f]*\d)[0-9a-f]{8,}$|^\d{5,}$",
     re.IGNORECASE,
 )
+# Listing pages that only repeat links to other pages.
+LISTING_SEGMENTS = {"archive", "archives", "author", "authors", "category", "categories",
+                    "page", "tag", "tags"}  # fmt: skip
+# Query parameters for page 2, 3, ... of a listing.
+PAGE_PARAMS = {"p", "page", "paged"}
 DATE_IN_SLUG = re.compile(r"(19|20)\d{2}[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
 
 
@@ -138,7 +145,7 @@ class SiteLayout:
         if total < MIN_URLS_FOR_DEEPER_GROUPING:
             return None
         folder, count = tops.most_common(1)[0]
-        if folder in ARCHIVE_FOLDERS or count < total * DOMINANT_FOLDER_SHARE:
+        if folder in ARCHIVE_FOLDERS | LISTING_SEGMENTS or count < total * DOMINANT_FOLDER_SHARE:
             return None
         return folder
 
@@ -202,9 +209,38 @@ class SiteLayout:
     def is_item(self, url: str) -> bool:
         """A post, story or record: a dated URL, or one with an ID in its path
         (/news/1038597/..., /careers/<uuid>). Sites add these daily."""
-        return self.is_dated(url) or any(ID_SEGMENT.match(s) for s in path_segments(url))
+        return self._is_dated_post(url) or any(ID_SEGMENT.match(s) for s in path_segments(url))
+
+    def is_listing(self, url: str) -> bool:
+        """A page that only lists other pages: tags, categories, authors, archives, page 2."""
+        segments = self.segments(url)
+        if any(segment in LISTING_SEGMENTS for segment in segments):
+            return True
+        if any(key.lower() in PAGE_PARAMS for key, _ in parse_qsl(urlsplit(url).query)):
+            return True
+        return self.is_date_archive(url)
+
+    def is_date_archive(self, url: str) -> bool:
+        """A path ending in a year (and maybe a month and day): /2002/, /blog/2024/05/.
+
+        Only at the top or under an archive folder, so /products/1984 stays a product.
+        """
+        segments = self.segments(url)
+        # /2026/nov/20/ -> /2026/: drop a trailing day, then a month, after a year.
+        if len(segments) >= 3 and DAY.match(segments[-1]) and MONTH.match(segments[-2]):
+            segments = segments[:-1]
+        if len(segments) >= 2 and MONTH.match(segments[-1]) and YEAR.match(segments[-2]):
+            segments = segments[:-1]
+        if not segments or not YEAR.match(segments[-1]):
+            return False
+        return len(segments) == 1 or segments[-2] in ARCHIVE_FOLDERS
 
     def is_dated(self, url: str) -> bool:
+        """A dated post or story, or a date archive: both change as new posts come out.
+        (A date archive is a listing too, so it ranks below other listings.)"""
+        return self._is_dated_post(url) or self.is_date_archive(url)
+
+    def _is_dated_post(self, url: str) -> bool:
         segments = self.segments(url)
         for year, month in zip(segments, segments[1:], strict=False):
             if YEAR.match(year) and MONTH.match(month):

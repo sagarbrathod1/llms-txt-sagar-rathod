@@ -8,7 +8,7 @@ import math
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from urllib.parse import urlsplit
 
@@ -26,8 +26,17 @@ MAX_PAGES_PER_SECTION = 15
 # The folder holding most of the site (MDN's /docs/) is grouped one level deeper; this caps
 # its total, so its subsections can't push everything else out of the file.
 MAX_DOMINANT_FOLDER_PAGES = 30
+# Tag, category, author, archive and page-2 pages only repeat links to other pages; a few
+# show how the site is organized (simonwillison.net listed 25 year archives and 15 tags).
+MAX_LISTING_PAGES = 3
+# Dated posts and stories churn: each new one would change the monitored file. They rank
+# below evergreen pages, and at most this many are listed, the ones the site links to most,
+# so a blog still lists some posts rather than none.
+MAX_DATED_PAGES = 5
 # Optional pages are by definition skippable; a handful is enough to point at them.
 MAX_OPTIONAL_PAGES = 10
+# Job postings come and go; one or two show the site has them, the careers page lists the rest.
+MAX_JOB_PAGES = 2
 # Sections with fewer pages than this are merged into the general section, so the file
 # doesn't become a long list of one-link headings.
 MIN_SECTION_SIZE = 2
@@ -48,9 +57,6 @@ BOOSTED_SEGMENTS = {
     "guide", "guides", "integrations", "learn", "platform", "pricing", "product", "products",
     "quickstart", "reference", "solutions", "tutorial", "tutorials",
 }  # fmt: skip
-# Listing pages that only repeat links to other pages.
-LISTING_SEGMENTS = {"archive", "archives", "author", "authors", "category", "categories",
-                    "page", "tag", "tags"}  # fmt: skip
 # Policy, account and job pages an agent rarely needs: they go under "## Optional".
 LOW_VALUE_SEGMENTS = {
     "accessibility", "accessibility-statement", "account", "accounts", "aup", "careers", "cart",
@@ -79,6 +85,11 @@ POLICY_SLUG = re.compile(
 )
 # File extensions some sites keep in their URLs (Patagonia's /privacy-notice.html).
 PAGE_EXTENSION = re.compile(r"\.(aspx?|html?|jsp|php)$")
+# Folders of job postings: /careers/<posting> is one job, /careers itself the list of them.
+JOB_FOLDERS = {"career", "careers", "job", "jobs"}
+# Kinds of page capped in total across sections (Ranker.kinds).
+DEEP, LISTING, DATED, JOB = "deep", "listing", "dated", "job"
+MAIN_CAPS = {LISTING: MAX_LISTING_PAGES, DATED: MAX_DATED_PAGES}
 # Words in section names that are abbreviations despite containing vowels.
 ACRONYMS = {"ai", "api", "cli", "eu", "faq", "ios", "seo", "til", "ui", "uk", "url", "us"}
 
@@ -107,7 +118,7 @@ class Ranker:
         total += min(self.inlinks.get(url, 0), MAX_INLINKS_COUNTED)
         if segments and segments[0] in BOOSTED_SEGMENTS:
             total += 2
-        if any(segment in LISTING_SEGMENTS for segment in segments):
+        if self.layout.is_listing(url):
             total -= 5
         if self.layout.is_versioned(url):
             total -= 4  # an old or upcoming docs version; the current one should win
@@ -133,35 +144,36 @@ class Ranker:
         limit: int,
         per_section: int,
         already: Sequence[str] = (),
-        cap_dominant: bool = False,
+        caps: Mapping[str, int] | None = None,
     ) -> list[str]:
         """Take up to `limit` URLs in rank order, skipping copies and capping each section.
 
         A copy is the same page in another docs version (version_free_key). Top-level pages
-        aren't capped: they're usually the site's main pages. With cap_dominant, the folder
-        holding most of the site is also capped in total. `already` continues an earlier
-        pick: its URLs count toward every cap and are returned first.
+        aren't capped: they're usually the site's main pages. `caps` limits kinds of pages
+        across all sections (see kinds). `already` continues an earlier pick: its URLs count
+        toward every cap and are returned first.
         """
+        caps = caps or {}
         taken: list[str] = []
         keys: set[str] = set()
         counts: Counter[str | None] = Counter()
-        in_dominant = 0
+        kind_counts: Counter[str] = Counter()
         previous = set(already)
         for url in [*already, *(url for url in ranked if url not in previous)]:
             if len(taken) == limit:
                 break
             key = self.layout.version_free_key(url)
             folder = self.section_folder(url)
-            dominant = self.layout.is_in_dominant_folder(url)
+            kinds = self.kinds(url)
             if url not in previous and (
                 key in keys
-                or (folder is not None and counts[folder] == per_section)
-                or (cap_dominant and dominant and in_dominant == MAX_DOMINANT_FOLDER_PAGES)
+                or (folder is not None and counts[folder] >= per_section)
+                or any(kind_counts[kind] >= caps[kind] for kind in kinds if kind in caps)
             ):
                 continue
             keys.add(key)
             counts[folder] += 1
-            in_dominant += dominant
+            kind_counts.update(kinds)
             taken.append(url)
         return taken
 
@@ -175,6 +187,20 @@ class Ranker:
         share = math.ceil(limit / max(len(sections), 1))
         taken = self.pick(ranked, limit, share)
         return self.pick(ranked, limit, limit, already=taken)
+
+    def kinds(self, url: str) -> set[str]:
+        """The kinds of page `url` is that are capped in total (see the MAX_*_PAGES caps)."""
+        kinds = set()
+        if self.layout.is_in_dominant_folder(url):
+            kinds.add(DEEP)
+        if self.layout.is_listing(url):
+            kinds.add(LISTING)
+        if self.layout.is_dated(url):
+            kinds.add(DATED)
+        segments = self.layout.segments(url)
+        if len(segments) >= 2 and segments[0] in JOB_FOLDERS:
+            kinds.add(JOB)
+        return kinds
 
     def section_folder(self, url: str) -> str | None:
         """The folder path that names this page's section, or None for the general section.
@@ -218,7 +244,7 @@ class Ranker:
         only near the root: /legal/terms and /about/privacy are policies, but a deep
         /docs/web/privacy page is content about privacy."""
         segments = [self._slug(segment) for segment in self.layout.segments(url)]
-        if not segments or LISTING_SEGMENTS & set(segments):  # /tags/privacy: posts on privacy
+        if not segments or self.layout.is_listing(url):  # /tags/privacy lists posts on privacy
             return False
         if _is_policy_name(segments[0]):
             return True
@@ -248,11 +274,15 @@ class Ranker:
         ranked = self.rank(self.layout.without_version_copies(list(by_url)))
         regular = [url for url in ranked if not self.is_low_value(url)]
         # The dominant folder's cap makes room for the rest of the site; if the rest can't
-        # use it (a site that's almost all docs), the fill pass gives it back.
-        main = self.pick(regular, MAX_PAGES, MAX_PAGES_PER_SECTION, cap_dominant=True)
-        main = self.pick(regular, MAX_PAGES, MAX_PAGES_PER_SECTION, already=main)
+        # use it (a site that's almost all docs), the fill pass gives it back. Listing and
+        # dated pages are capped throughout.
+        caps = MAIN_CAPS | {DEEP: MAX_DOMINANT_FOLDER_PAGES}
+        main = self.pick(regular, MAX_PAGES, MAX_PAGES_PER_SECTION, caps=caps)
+        main = self.pick(regular, MAX_PAGES, MAX_PAGES_PER_SECTION, already=main, caps=MAIN_CAPS)
         optional = [url for url in ranked if self.is_low_value(url)]
-        optional = self.pick(optional, MAX_OPTIONAL_PAGES, MAX_OPTIONAL_PAGES)
+        optional = self.pick(
+            optional, MAX_OPTIONAL_PAGES, MAX_OPTIONAL_PAGES, caps={JOB: MAX_JOB_PAGES}
+        )
 
         groups: dict[str | None, list[str]] = {}
         for url in main:  # rank order, so each group's first URL is its best
