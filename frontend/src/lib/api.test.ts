@@ -58,7 +58,7 @@ describe("request", () => {
     );
     const err = await failure(getSite("s1"));
     expect(err.status).toBeNull();
-    expect(err.message).toMatch(/network or CORS/);
+    expect(err.message).toBe("Couldn't connect. Try again in a moment.");
   });
 
   it("gives up on a request that never answers", async () => {
@@ -70,6 +70,6 @@ describe("request", () => {
     );
     const err = await failure(getSite("s1"));
     expect(err.status).toBeNull();
-    expect(err.message).toMatch(/took too long/);
+    expect(err.message).toMatch(/longer than usual/);
   });
 });
